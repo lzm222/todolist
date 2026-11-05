@@ -218,28 +218,59 @@ val isEmpty get() = if (isToday) groups.isEmpty() && overdue.isEmpty()
 ### 6.4 完成 ≠ 滑开 ≠ 删除（三件事必须分开）
 
 - **勾选**：`isDone` 置位，条目**留在原地**，划线 + 灰化。
-- **滑开**：`SwipeToDismissBox` 只把行推到 `EndToStart` 展开态、露出背景按钮，**不写数据库**。
+- **滑开**：`anchoredDraggable` 只把行位移到 `Open` 锚点（= `-88.dp`）露出背景按钮，**不写数据库**。
 - **删除**：只有用户**点击**背景那个删除按钮才调 `onDelete`，`deleted` 置位，Snackbar 提供「撤销」。
-- **右滑不响应**：`enableDismissFromStartToEnd = false`。背景只实现了一侧按钮，两个方向都能滑纯属误触入口。
+- **右滑不响应**：位移被钳在 `coerceAtMost(0)`，锚点全为非正值，向右拖动无任何位移。
 - **批量删除**：长按进入多选 → 标题栏换成 `SelectionTopBar` → 删除图标弹 `BatchDeleteConfirmDialog` 二次确认 → `viewModel.deleteBatch(targets)`。
 - 撤销判定靠 `msg.startsWith("已删除")`；`lastDeleted` 的类型是 `List<HomeworkItem>`，**非删除类消息必须清空它**，防止误撤销上一条。
 - 单条删除与批量删除共用 `undoDeleteBatch`（长度 1 的批量）。不要为单条另开一条撤销通道。
 
-### 6.5 滑开只是展开，绝不要写成「滑开即删」
+### 6.5 滑开只是展开，绝不能「滑开即删」或「滑到头」
 
-`HomeworkItemRow` 的 `rememberSwipeToDismissBoxState`：
+`HomeworkItemRow` 用的是 **`AnchoredDraggableState` + `Modifier.anchoredDraggable`**，
+**不是** `SwipeToDismissBox`。这条是 v1.6 的核心，改回 `SwipeToDismissBox` 会让
+「滑开只露按钮」直接失效（见 §9）。
 
-- `positionalThreshold` **必须显式传入**，值为 `屏幕宽度 × 0.3`。默认值是固定 56dp（`SwipeToDismissBoxDefaults`
-  字节码里 `bipush 56`），在垂直滚动中一次轻微横向漂移就能越过，这正是 v1.5 要修的误触根源。
-  计算方式：`LocalDensity` 取 `screenWidthDp.dp.toPx()`，注意 `positionalThreshold` 的单位是**像素**。
-- `confirmValueChange` **已弃用**（字节码原文含 `confirmValueChange is deprecated without replacement`），
-  **不要再用它**，也不要指望它做「拦截」。
-- `SwipeToDismissBox(onDismiss = { })` **必须留空**。谁把删除写进 `onDismiss`，滑开就会立刻删除，
-  v1.5 的修复全部作废，退回误触。
-- 行**允许长期停在 `EndToStart`**——这正是「等用户再点按钮」的载体。不要再写「删完立刻 `reset()`」，
-  也不要把「未删除却处于展开态」当成异常去强制复位。
-- 背景删除按钮 `enabled = dismissState.currentValue == EndToStart`，只有真正展开后按钮才可点，
-  避免行在动画途中的瞬时回调误触。
+- **为什么不能用 `SwipeToDismissBox`**：它是二态吸附（`Settled` / `Dismissed`），
+  `Dismissed` 的停靠位是**整行滑出屏幕**。一旦越过阈值就吸附到那个位置，
+  库本身没有「停在任意偏移量」的概念——所以无论阈值调多大，滑开都会滑到头，
+  背景按钮只露出一瞬就被带走。这就是 v1.6 要修的问题。
+- **锚点即位移上限**：`Open` 锚点必须写成 `-buttonWidthPx`（`buttonWidthPx` 由
+  `DeleteButtonWidth = 88.dp` 换算而来）。这样「滑开的终点」在物理上就等于
+  「只露出 88dp 按钮」，**天然越不过去**。不要把它改成屏幕宽度或其它魔数。
+- **`anchoredDraggable` 的参数组合（已验证可编译、零 warning）**：
+  ```kotlin
+  val state: AnchoredDraggableState<RowAnchor> = remember { AnchoredDraggableState(initialValue = RowAnchor.Settled) }
+  val flingBehavior = AnchoredDraggableDefaults.flingBehavior(   // 是 @Composable，不能包在 remember 里
+      state = state,
+      positionalThreshold = { distance: Float -> distance * 0.5f },  // 行程过半才吸附
+      animationSpec = AnchoredDraggableDefaults.SnapAnimationSpec,
+  )
+  modifier.anchoredDraggable(state = state, orientation = Orientation.Horizontal,
+                             enabled = !selectionMode, flingBehavior = flingBehavior)
+  ```
+- **不要用 `reverseDirection` 重载**：字节码确认该重载已标 `Deprecated`，用它会出 warning。
+  方向靠锚点符号 + `offset` 钳制实现，不靠手势方向参数。
+- **不要给 `state.positionalThreshold` / `velocityThreshold` 赋值**：这两个字段是
+  `internal`（字节码后缀 `$foundation`），外部不可写。阈值只能走 `flingBehavior`。
+- **不要走带阈值参数的顶层工厂函数**：它与类构造器同名、会产生解析歧义，
+  且必须同时补齐 `snapAnimationSpec` / `decayAnimationSpec` 两个必填参数，
+  否则报 `Cannot infer type for type parameter 'T'`。用简单构造器 + `flingBehavior` 即可。
+- **位移渲染必须钳制**：`Modifier.offset { IntOffset(state.offset.roundToInt().coerceAtMost(0), 0) }`。
+  `coerceAtMost(0)` 就是「右滑无响应」的实现，别删。
+- **NaN 防护**：首帧锚点还没建立时 `state.offset` 为 `NaN`，
+  计算 `progress` 先判 `if (state.offset.isNaN()) 0f else ...`，否则背景 alpha 会崩。
+- **锚点随宽度重建**：`LaunchedEffect(buttonWidthPx)` 里用
+  `DraggableAnchors { RowAnchor.Settled at 0f; RowAnchor.Open at -buttonWidthPx }`
+  调 `state.updateAnchors(newAnchors, state.currentValue)`。
+- **展开/收起由 `isRevealed` 单向驱动**：`LaunchedEffect(isRevealed, selectionMode)` 里
+  `shouldOpen = isRevealed && !selectionMode` → `animateTo(Open / Settled)`。
+  行**允许长期停在 `Open`**，这是「等用户再点按钮」的载体。
+- **回写给父层用 `settledValue`**：`LaunchedEffect(state)` 里
+  `snapshotFlow { state.settledValue }.collect { onRevealChange(it == RowAnchor.Open) }`。
+  用 `settledValue` 而非 `currentValue`/`targetValue`，避免动画途中的中间态抖动回调。
+- **背景按钮可用性**：`enabled = state.settledValue == RowAnchor.Open`，
+  只有真正停靠在展开锚点后才可点，避免动画途中误触。
 - 展开是**互斥**的：`HomeworkScreen` 用 `revealedId: Long?` 保存唯一展开行的 id，
   `onRevealChange = { id, open -> revealedId = if (open) id else if (revealedId == id) null else revealedId }`。
   收起分支**必须**比对 id，否则旧行的延迟回调会把新行的展开态清掉。
@@ -248,6 +279,7 @@ val isEmpty get() = if (isToday) groups.isEmpty() && overdue.isEmpty()
 
 原因：让行消失的应该是**数据变化**，不是组件内部状态。但「展开」本身是合法的稳定状态，
 所以它可以长期存在、也可以被撤销——这是与旧实现（滑开即删）的根本区别。
+
 
 ### 6.6 可点击组件：命中区域 = 视觉区域
 
@@ -308,7 +340,8 @@ Row(
 7. 大改动前建议先备份到 `.fixbak/todolist-<HHMMSS>/`（现有基线：`.fixbak/todolist-172157/`）。
 8. `git add -A && git commit`，**一个 Bug 一次提交**，见 §8.1。
 
-交付目录现状（均为 20,387,672 字节）：`v1.0` / `v1.1` / `v1.2` / `v1.3` / `v1.4`。
+交付目录现状（均为 20,387,672 字节）：`v1.0` / `v1.1` / `v1.2` / `v1.3` / `v1.4` / `v1.5` / `v1.6`。
+v1.6 的 MD5 为 `6a2a556671625e4240c8a2357292a3cd`（滑动删除改为 `anchoredDraggable` 实现）。
 
 ### 8.1 版本控制约定
 
@@ -359,9 +392,15 @@ git status --short    # 期望空输出
 | `@Entity` 索引 ≠ 部分唯一索引 | 唯一性只在 `MIGRATION_1_2` 的 SQL 里，Room 无法从实体注解推导。升版本必须手写迁移。 |
 | `AssitTool` 拼写 | 少一个 `s`。IDE 重命名会把它改掉，注意别在 diff 里产生大面积无意义改动。 |
 | 空态整屏替换 | 曾经踩过：日期条被吞，用户无法切到历史日期。见 §6.1。 |
-| 把删除写进 `onDismiss` | 滑开即删，退回 v1.5 修掉的误触。`onDismiss` 必须留空。见 §6.5。 |
-| 用 `confirmValueChange` 做拦截或删数据 | 该参数已弃用（无替代），且容易让行卡在 dismissed。见 §6.5。 |
-| 不传 `positionalThreshold` | 默认固定 56dp，垂直滚动时的横向漂移就能越过，误触会立刻回来。见 §6.5。 |
+| 用 `SwipeToDismissBox` 做滑动删除 | 它是二态吸附，「已 dismiss」= **整行滑出屏幕**，无论阈值多大都停不住中间态，滑开必然滑到头。v1.6 已换成 `anchoredDraggable`，别改回去。见 §6.5。 |
+| 把 `Open` 锚点写成屏幕宽度 | 锚点就是位移上限。写成屏宽行会整条滑出；必须等于 `-buttonWidthPx`（88dp），这才是「只露按钮」。见 §6.5。 |
+| 用 `anchoredDraggable` 的 `reverseDirection` 重载 | 该重载字节码已标 `Deprecated`，会出 warning。方向靠锚点符号 + `offset` 钳制。见 §6.5。 |
+| 给 `state.positionalThreshold` 赋值 | 该字段是 `internal`（字节码后缀 `$foundation`），外部写不了。阈值只能通过 `AnchoredDraggableDefaults.flingBehavior(positionalThreshold = ...)` 传。见 §6.5。 |
+| 给 `AnchoredDraggableState` 工厂函数只传 `initialValue` | 会报 `Cannot infer type for type parameter 'T'`——工厂函数还需 `snapAnimationSpec` / `decayAnimationSpec` 两个必填参数。用简单构造器 + `flingBehavior` 更省事。见 §6.5。 |
+| `flingBehavior` 包进 `remember {}` | `AnchoredDraggableDefaults.flingBehavior` 是 `@Composable`，放进 `remember` lambda 里会编译失败。直接在当前 composable 作用域调用。见 §6.5。 |
+| 删掉 `offset` 里的 `coerceAtMost(0)` | 它同时承担「右滑无响应」与「位移不越界」，删了右滑就会带动行。见 §6.5。 |
+| 忘判 `state.offset.isNaN()` | 首帧锚点未建立时 offset 是 `NaN`，直接算 `progress` 会让背景 alpha 崩。见 §6.5。 |
+| 用 `currentValue`/`targetValue` 回写 `onRevealChange` | 动画途中值会抖动，导致展开态反复翻转。必须用 `settledValue`。见 §6.5。 |
 | 多选状态塞进 ViewModel | 选中集合是纯 UI 私有状态，进 UiState 会给 `combine` 增加无意义同步点，还会让「全选范围」与可见行脱钩。见 §2。 |
 | 全选按全库算而不是按可见行算 | 逾期栏在历史日期不渲染，此时不该被全选选中。`selectableIds` 已按 `isToday` 分支处理，别改成平铺。见 §6.4。 |
 | 往仓库里漏提交 `app/build` 或 `local.properties` | `app/build` 有 97M，`local.properties` 含 `/root/Android` 机器路径。`git add -A` 前先 `git status --short` 扫一眼，或用 `git add -A --dry-run` 预检。见 §8.1。 |
@@ -370,5 +409,5 @@ git status --short    # 期望空输出
 
 ## 10. 一句话原则
 
-> **完成与删除分离、唯一性靠部分索引、空态嵌在列表里、命中区等于视觉区、文案只在 ViewModel。**
-> 这五条是这个项目全部修复历史的沉淀，改任何一处之前先确认不会破坏它们。
+> **完成与删除分离、唯一性靠部分索引、空态嵌在列表里、命中区等于视觉区、文案只在 ViewModel、滑开只露按钮。**
+> 这六条是这个项目全部修复历史的沉淀，改任何一处之前先确认不会破坏它们。
