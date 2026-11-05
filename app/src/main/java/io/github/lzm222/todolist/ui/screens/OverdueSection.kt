@@ -26,17 +26,10 @@ import io.github.lzm222.todolist.ui.OverdueEntry
 @Composable
 fun OverdueSection(
     entries: List<OverdueEntry>,
+    rowUi: RowInteraction,
     onToggleDone: (HomeworkItem) -> Unit,
     onDelete: (HomeworkItem) -> Unit,
     modifier: Modifier = Modifier,
-    revealedId: Long? = null,
-    draggingId: Long? = null,
-    onRevealChange: (Long, Boolean) -> Unit = { _, _ -> },
-    onDragStateChange: (Long, Boolean) -> Unit = { _, _ -> },
-    selectionMode: Boolean = false,
-    selectedIds: Set<Long> = emptySet(),
-    onToggleSelect: (HomeworkItem) -> Unit = {},
-    onLongPress: (HomeworkItem) -> Unit = {},
 ) {
     if (entries.isEmpty()) return
 
@@ -77,16 +70,9 @@ fun OverdueSection(
             key("overdue-" + entry.item.id) {
                 OverdueRow(
                     entry = entry,
+                    rowUi = rowUi,
                     onToggleDone = { onToggleDone(entry.item) },
                     onDelete = { onDelete(entry.item) },
-                    isRevealed = revealedId == entry.item.id,
-                    onRevealChange = { open -> onRevealChange(entry.item.id, open) },
-                    dragEnabled = draggingId == null || draggingId == entry.item.id,
-                    onDragStateChange = { dragging -> onDragStateChange(entry.item.id, dragging) },
-                    selectionMode = selectionMode,
-                    isSelected = entry.item.id in selectedIds,
-                    onToggleSelect = { onToggleSelect(entry.item) },
-                    onLongPress = { onLongPress(entry.item) },
                 )
             }
             Spacer(Modifier.height(6.dp))
@@ -94,19 +80,13 @@ fun OverdueSection(
     }
 }
 
+/** 逾期行的外层：科目名 + 逾期天数两个小标签，下面复用与当日清单完全相同的行组件。 */
 @Composable
 private fun OverdueRow(
     entry: OverdueEntry,
+    rowUi: RowInteraction,
     onToggleDone: () -> Unit,
     onDelete: () -> Unit,
-    isRevealed: Boolean,
-    onRevealChange: (Boolean) -> Unit,
-    dragEnabled: Boolean,
-    onDragStateChange: (Boolean) -> Unit,
-    selectionMode: Boolean,
-    isSelected: Boolean,
-    onToggleSelect: () -> Unit,
-    onLongPress: () -> Unit,
 ) {
     Column(modifier = Modifier.padding(horizontal = 12.dp)) {
         Row(
@@ -132,18 +112,11 @@ private fun OverdueRow(
                 )
             }
         }
-        HomeworkItemRow(
+        InteractiveHomeworkRow(
             item = entry.item,
+            rowUi = rowUi,
             onToggleDone = onToggleDone,
             onDelete = onDelete,
-            isRevealed = isRevealed,
-            onRevealChange = onRevealChange,
-            dragEnabled = dragEnabled,
-            onDragStateChange = onDragStateChange,
-            selectionMode = selectionMode,
-            isSelected = isSelected,
-            onToggleSelect = onToggleSelect,
-            onLongPress = onLongPress,
         )
     }
 }

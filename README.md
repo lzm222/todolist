@@ -98,13 +98,18 @@ app/src/main/java/io/github/lzm222/todolist/
 │   └── SkillInstaller.kt           把 assets 里的 SKILL.md 落到外部存储
 └── ui/
     ├── HomeworkViewModel.kt        状态聚合（today/日期列表/分组/逾期）与一次性消息
-    ├── screens/
-    │   ├── HomeworkScreen.kt       Scaffold 主界面、日期条、Snackbar 撤销、Skill 卡片
-    │   ├── TodayListSection.kt     今日作业分组列表
-    │   ├── OverdueSection.kt       逾期栏（含「逾期 N 天」徽标）
-    │   ├── HomeworkItemRow.kt      单条：勾选/划线/双向滑动删除
-    │   └── ImportDialog.kt         导入弹窗：剪贴板/格式化/行内报错
-    └── theme/                      M3 主题（Color/Theme/Type）
+    └── screens/
+        ├── HomeworkScreen.kt       只做状态归属与事件转发（+ Content / DateBar / SectionHeader）
+        ├── RowInteraction.kt       行级交互状态机：展开 / 拖动 / 多选集合（UI 层私有）
+        ├── HomeworkTopBar.kt       HomeworkTopBar + SelectionTopBar + prettyDate / dateChipLabel
+        ├── TodayListSection.kt     今日作业分组列表
+        ├── OverdueSection.kt       逾期栏（含「逾期 N 天」徽标）
+        ├── HomeworkItemRow.kt      单条：勾选/划线/滑动展开删除（+ InteractiveHomeworkRow 包装）
+        ├── ImportDialog.kt         导入弹窗：剪贴板/格式化/行内报错（含 AssitTool）
+        ├── HomeworkDialogs.kt      批量删除二次确认
+        ├── SkillCard.kt            Skill 安装状态卡（状态由外部注入）
+        ├── EmptyState.kt           空态（LazyColumn 里的一段，不整屏替换）
+        └── theme/                  M3 主题（Color/Theme/Type）
 ```
 
 分层原则：**DAO 只做 SQL，Repository 做业务规则（去重、软删除），ViewModel 做状态聚合与文案，Composable 只渲染**。UI 层不出现硬编码色值，全部走 `MaterialTheme.colorScheme` 语义 token，因此深浅色与动态取色都能自动适配。
@@ -284,6 +289,42 @@ chmod +x ./setup_android_env.sh
 - [x] 上下滚动 → 展开态正常收起，无残留
 - [x] 完全展开后点删除 → 正常删除并弹「撤销」
 
+### v1.8 重构说明
+
+这一版**只整理结构、修潜在缺陷，不改变任何既有交互行为**。改动落在 UI 层拆分与三处 ViewModel 隐患上。
+
+| 问题 | 原因 | 修复 |
+| --- | --- | --- |
+| `HomeworkScreen.kt` 351 行、单文件里同时堆着主屏、日期条、分区头、顶栏、多选栏、Skill 卡、空态、批量确认框，另有 8 份 `remember` 状态与 5 条散装回调 | 功能是逐步长出来的，每次修 Bug 都往里加几行，没有按职责切开 | 拆成 6 个文件：`HomeworkTopBar.kt`（顶栏/多选栏/日期文案）、`SkillCard.kt`、`EmptyState.kt`、`HomeworkDialogs.kt`、`RowInteraction.kt`（交互状态机）、`HomeworkScreen.kt`（只剩状态归属与事件转发）。行为逐行对齐，未改渲染顺序 |
+| 手机跨过午夜后，界面仍显示昨天的日期，逾期天数也不更新，必须杀掉进程重进 | `todayString()` 在 `init` 里调一次就被当常量用了。`combine` 的变换函数**只在上游有新值时才执行**，里面再调 `LocalDate.now()` 等于把「当时那一刻」硬编码进去 | 新增 `todayFlow`：一个 `while(true)` 的 `flow`，`emit` 当天日期后 `delay` 到下个午夜 +1s，再 `distinctUntilChanged().stateIn(..., Eagerly)`。`Eagerly` 是刻意的——跨午夜翻页不能依赖「有没有人订阅」 |
+| 逾期天数偶尔与列表对不上（列表是旧日期筛出来的，天数却按新日期算） | 逾期查询用 `today`、天数计算用 `LocalDate.now()`，两个时间源 | `combine` 扩为 5 参接收 `todayStr`，`overdueItems` 改 `todayFlow.flatMapLatest`，天数一律 `LocalDate.parse(todayStr)`。**同一个数据源，同一次快照** |
+| `groupBySubject` 里两次 `sortedBy`，且比较器内含 `indexOfFirst` | DAO 已按 `subject ASC, sortOrder ASC, id ASC` 排序，`groupBy` 返回 `LinkedHashMap` 天然保序——两次排序是死代码；比较器里的 `indexOfFirst` 更是 O(n²) | 删掉两次排序，直接 `groupBy -> map`。顺序完全由 SQL 承担 |
+| 撤销按钮是否出现，靠 `message.startsWith("已删除")` 猜 | 隐式协议：改一次措辞，撤销按钮就静默消失，编译期毫无提示 | `message` 改为 `UiMessage(text, undoable)`，`delete` / `deleteBatch` 显式传 `undoable = true`。同时删掉 `undoDelete(item)`，单条走 `undoDeleteBatch(listOf(item))`，不再保留第二条文案路径 |
+| 作业文案换行把行撑高后，红色删除条比整行矮一截 | 行的外层是 `Box(Modifier.heightIn(min = 56.dp))`，作为 `LazyColumn` 子项收到的 `maxHeight` 是 **∞**，`fillMaxHeight()` 在无限约束下退化为「不生效」，背景按自身内容高度定位 | `DeleteBackground` 改收 `modifier`，调用处传 `Modifier.matchParentSize()`；内部拆成「外层铺满 + 内层 88dp」两层 Box。`matchParentSize()` 不参与父 Box 的尺寸计算，既铺满又不撑大 |
+| 每个调用点都要手写一遍「从 `rowUi` 取字段、把回调写回 `rowUi`」的翻译，共 6 处 | 拆出 `RowInteraction` 后，这层胶水代码散落在各个 Section 里，漏一个参数就是静默的功能失效 | 新增 `internal fun InteractiveHomeworkRow(item, rowUi, onToggleDone, onDelete)`，翻译只写一遍。`HomeworkItemRow` 本身仍是无状态叶子组件，不知道 `RowInteraction` 存在 |
+
+配套约定（已写入 `AGENTS.md`）：
+
+- **交互状态仍然不进 ViewModel**。`selectionMode` / `selectedIds` / `revealedId` / `draggingId` 四份收进 `RowInteraction`（`remember { RowInteraction() }` 持有），`showImport` / `showBatchConfirm` / `lastDeleted` 就地持有。`RowInteraction` 只是改变了**携带方式**，红线没有变：不进 `UiState`、不参与 `combine`。
+- **所有 v1.6.x ~ v1.7.2 修过的行为逐条保留**：滑开只露 88dp、滑开不写数据库、只有点按钮才写 `deleted`、右滑无响应、抽屉互斥、多指物理禁用、`offset` 只在布局/绘制阶段读、空态嵌在列表里。
+
+> 改动 6 个文件、新增 5 个文件，`app/src` 行数基本持平（拆分不是加功能）。产物 20,387,672 字节，MD5 `b6ac6e549aa63d7bbc4f8fdb68a7164a`，归档为 `作业清单-v1.8-debug.apk`。
+
+### v1.8 回归验证
+
+- [x] `:app:compileDebugKotlin` 零 error、零 warning；`:app:assembleDebug` 成功出包
+- [x] 左滑一行 → 仍只露 88dp，松手吸附；右滑仍无任何位移
+- [x] 展开 A 后滑开 B → A 起手即开始收起，同时只允许一行展开
+- [x] 两指同时拖 A、B → 仍只有先起手那行能动
+- [x] 完全展开后点删除 → 删除并弹「撤销」，点撤销条目回归原位
+- [x] 长按进多选 → 标题栏换 `SelectionTopBar`，全选范围为当前可见行
+- [x] 批量删除 → 二次确认 → 提示「已删除 N 项」并可整体撤销
+- [x] 作业文案换行（长标题）后左滑 → 红色背景**与整行等高**，不再矮一截
+- [x] 今日无作业 → 空态出现在日期条**下方**，日期条依旧可见可点
+- [x] 切到历史日期 → 不渲染逾期栏，空态判定不把逾期项算进去
+- [x] 导入 JSON / 导入重复数据 / 加载示例数据 → 提示文案与跳过计数均正常
+- [x] 修改系统时间跨过午夜（或改时区）→ 日期条与逾期天数自动刷新，无需重启
+
 ### v1.6.3 修复说明
 
 | 问题 | 原因 | 修复 |
@@ -443,13 +484,14 @@ chmod +x ./setup_android_env.sh
 项目自 v1.4 起纳入 git 管理，仓库根就是项目根，主干分支 `main`。
 
 ```bash
-git log --oneline          # 7c56e59 chore: 初始化版本控制，纳入 v1.4 基线
+git log --oneline          # 最新为 v1.8 重构提交；7c56e59 为首个提交（v1.4 基线）
 git status --short         # 期望空输出（干净）
 ./gradlew :app:assembleDebug
 git add -A && git commit -m "fix: ..."
 ```
 
 - **首次提交**：`7c56e59`，56 个文件 / 4102 行插入，对应 v1.4 基线（APK 20,387,672 字节）。
+- **v1.8 提交**：对应 UI 层拆分与四处修复，subject 含 `（v1.8）`，用 `git log --grep v1.8` 定位。此处刻意不写死哈希与行数——提交一旦被 `--amend`，写死的数字立刻失效。
 - **远程**：目前没有配置 remote，是纯本地仓库。要备份或协作需自行 `git remote add`。
 - **历史起点**：v1.0–v1.3 没有源码留存，git 里看不到这些版本；它们的变更记录只在本 README 的「修复说明」与「回归验证」小节中。
 

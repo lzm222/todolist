@@ -18,24 +18,17 @@ import io.github.lzm222.todolist.ui.SubjectGroup
 /**
  * 当日清单：按科目分组展示。
  *
- * 多选与「单行展开」都是 UI 层私有状态，由 [HomeworkScreen] 持有并通过下面的参数下发：
- * - [revealedId]：当前展开删除按钮的行 id（互斥，同一时刻只有一行展开）
- * - [selectionMode] / [selectedIds]：多选态
+ * 这里**只管分组与排版**，行级交互（展开 / 拖动 / 多选）整包交给 [rowUi]：
+ * 之前是 8 个参数逐个往下透传到 `HomeworkItemRow`，加一个交互状态就要改 4 个文件，
+ * 且漏传一处就是「某个入口悄悄失效」。现在中间层只认一个对象。
  */
 @Composable
 fun TodayListSection(
     groups: List<SubjectGroup>,
+    rowUi: RowInteraction,
     onToggleDone: (HomeworkItem) -> Unit,
     onDelete: (HomeworkItem) -> Unit,
     modifier: Modifier = Modifier,
-    revealedId: Long? = null,
-    draggingId: Long? = null,
-    onRevealChange: (Long, Boolean) -> Unit = { _, _ -> },
-    onDragStateChange: (Long, Boolean) -> Unit = { _, _ -> },
-    selectionMode: Boolean = false,
-    selectedIds: Set<Long> = emptySet(),
-    onToggleSelect: (HomeworkItem) -> Unit = {},
-    onLongPress: (HomeworkItem) -> Unit = {},
 ) {
     Column(modifier = modifier.fillMaxWidth()) {
         groups.forEach { group ->
@@ -47,18 +40,11 @@ fun TodayListSection(
                 // 用条目 id 作为稳定 key：滑动删除时 Compose 才能准确识别"这一行",
                 // 而不是把状态错配到相邻的同类组件上（那会导致动画卡住/串行）
                 key("item-" + item.id) {
-                    HomeworkItemRow(
+                    InteractiveHomeworkRow(
                         item = item,
+                        rowUi = rowUi,
                         onToggleDone = { onToggleDone(item) },
                         onDelete = { onDelete(item) },
-                        isRevealed = revealedId == item.id,
-                        onRevealChange = { open -> onRevealChange(item.id, open) },
-                        dragEnabled = draggingId == null || draggingId == item.id,
-                        onDragStateChange = { dragging -> onDragStateChange(item.id, dragging) },
-                        selectionMode = selectionMode,
-                        isSelected = item.id in selectedIds,
-                        onToggleSelect = { onToggleSelect(item) },
-                        onLongPress = { onLongPress(item) },
                     )
                 }
             }

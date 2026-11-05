@@ -10,15 +10,19 @@ import io.github.lzm222.todolist.data.HomeworkRepository
 import io.github.lzm222.todolist.data.SampleData
 import io.github.lzm222.todolist.parse.HomeworkJsonParser
 import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.flatMapLatest
+import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import java.time.LocalDate
+import java.time.LocalDateTime
 import java.time.format.DateTimeFormatter
 import java.time.temporal.ChronoUnit
 
@@ -27,6 +31,16 @@ data class SubjectGroup(val subject: String, val items: List<HomeworkItem>)
 
 /** 逾期条目 + 逾期天数。 */
 data class OverdueEntry(val item: HomeworkItem, val days: Int)
+
+/**
+ * 一条一次性提示（Snackbar）。
+ *
+ * 为什么不是裸 `String`：能否撤销原本靠「文案以『已删除』开头」来猜
+ * （`msg.startsWith("已删除")`，见 AGENTS.md §6.4 的历史写法）。那是一条隐式协议——
+ * 改一次文案措辞，撤销按钮就会静默消失，而且编译器一点忙也帮不上。
+ * 现在把「可不可撤销」变成消息自带的字段，与文案彻底解耦。
+ */
+data class UiMessage(val text: String, val undoable: Boolean = false)
 
 data class HomeworkUiState(
     val today: String = LocalDate.now().format(DateTimeFormatter.ISO_LOCAL_DATE),
@@ -79,21 +93,50 @@ class HomeworkViewModel(private val repo: HomeworkRepository) : ViewModel() {
     private val _selectedDate = MutableStateFlow(LocalDate.now().format(iso))
     val selectedDate: StateFlow<String> = _selectedDate.asStateFlow()
 
-    /** 一次性提示消息（Snackbar） */
-    private val _message = MutableStateFlow<String?>(null)
-    val message: StateFlow<String?> = _message.asStateFlow()
+    /** 一次性提示消息（Snackbar）。是否可撤销由 [UiMessage.undoable] 决定。 */
+    private val _message = MutableStateFlow<UiMessage?>(null)
+    val message: StateFlow<UiMessage?> = _message.asStateFlow()
 
     val availableDates: StateFlow<List<String>> = repo.observeAllDates()
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
 
     private val dayItems = _selectedDate.flatMapLatest { date -> repo.observeByDate(date) }
 
+    /**
+     * 「今天」不是一个常量。
+     *
+     * 这是本类里最容易漏的一处：`combine` 的变换函数里确实每次都调了 `LocalDate.now()`，
+     * 看起来是动态的，但 **`combine` 只在上游有新值时才会重算**。数据不变时它一次都不会
+     * 重跑，于是「今天」永远停在上一次数据变化的那个日期。作业清单这种长期挂后台、
+     * 隔天再打开的应用正好踩中：跨过午夜后 `isToday`、逾期天数、日期条上的「今天」全错位。
+     *
+     * 修法是把「今天」提升成一条真实的数据流，每天午夜翻页，并作为 `combine` 的输入。
+     */
+    private val todayFlow: StateFlow<String> = flow {
+        while (true) {
+            val today = LocalDate.now()
+            emit(today.format(iso))
+            // 睡到下一个午夜。多睡 1 秒，确保醒来时已经越过日期边界
+            val waitMs = ChronoUnit.MILLIS
+                .between(LocalDateTime.now(), today.plusDays(1).atStartOfDay())
+                .coerceAtLeast(1_000L)
+            delay(waitMs + 1_000L)
+        }
+    }
+        .distinctUntilChanged()
+        .stateIn(viewModelScope, SharingStarted.Eagerly, todayString())
+
     /** 逾期只看"今天"的视角下才有意义，但数据始终计算好，UI 按 isToday 决定是否展示。 */
-    private val overdueItems = repo.observeOverdue(todayString())
+    private val overdueItems = todayFlow.flatMapLatest { today -> repo.observeOverdue(today) }
 
     val uiState: StateFlow<HomeworkUiState> =
-        combine(_selectedDate, dayItems, overdueItems, availableDates) { date, items, overdue, dates ->
-            val todayStr = todayString()
+        combine(
+            _selectedDate,
+            dayItems,
+            overdueItems,
+            availableDates,
+            todayFlow
+        ) { date, items, overdue, dates, todayStr ->
             HomeworkUiState(
                 today = todayStr,
                 selectedDate = date,
@@ -101,9 +144,13 @@ class HomeworkViewModel(private val repo: HomeworkRepository) : ViewModel() {
                 availableDates = (dates + todayStr).distinct().sortedDescending(),
                 groups = groupBySubject(items),
                 overdue = overdue.map { item ->
+                    // 天数用流里的 todayStr 算，不要再用 LocalDate.now()：
+                    // 否则同一帧里会出现「按旧日期筛出来的列表 + 按新日期算的天数」
                     val days = runCatching {
-                        ChronoUnit.DAYS.between(LocalDate.parse(item.dueDate, iso), LocalDate.now())
-                            .toInt()
+                        ChronoUnit.DAYS.between(
+                            LocalDate.parse(item.dueDate, iso),
+                            LocalDate.parse(todayStr, iso)
+                        ).toInt()
                     }.getOrDefault(0)
                     OverdueEntry(item, days)
                 }.filter { it.days > 0 },
@@ -140,11 +187,20 @@ class HomeworkViewModel(private val repo: HomeworkRepository) : ViewModel() {
         }
     }
 
+    /**
+     * 按科目分组。
+     *
+     * DAO 的查询已经把结果排成 `subject ASC, sortOrder ASC, id ASC`，而 `groupBy`
+     * 返回的是 `LinkedHashMap`，**保留首次出现顺序** —— 所以这里什么都不用再排：
+     * 分组顺序天然等于 `subject ASC`，组内顺序天然等于 `sortOrder ASC`。
+     *
+     * 原本这里叠了两次 `sortedBy`：第一次按 `sortOrder` 排（与 DAO 的 `subject ASC` 语义冲突），
+     * 第二次按「该科目首次出现的下标」排，把第一次的结果整个覆盖掉；而那个 `indexOfFirst`
+     * 是写在比较器里的，复杂度 O(n²)。两次排序加起来是纯粹的死代码，已删除。
+     */
     private fun groupBySubject(items: List<HomeworkItem>): List<SubjectGroup> =
         items.groupBy { it.subject }
             .map { (subject, list) -> SubjectGroup(subject, list) }
-            .sortedBy { it.items.firstOrNull()?.sortOrder ?: 0 }
-            .sortedBy { group -> items.indexOfFirst { it.subject == group.subject } }
 
     fun selectDate(date: String) {
         _selectedDate.value = date
@@ -163,7 +219,7 @@ class HomeworkViewModel(private val repo: HomeworkRepository) : ViewModel() {
     fun delete(item: HomeworkItem) {
         viewModelScope.launch {
             repo.delete(item.id)
-            _message.value = "已删除「${item.content}」"
+            _message.value = UiMessage("已删除「${item.content}」", undoable = true)
         }
     }
 
@@ -175,23 +231,21 @@ class HomeworkViewModel(private val repo: HomeworkRepository) : ViewModel() {
         if (items.isEmpty()) return
         viewModelScope.launch {
             repo.deleteBatch(items.map { it.id })
-            _message.value = "已删除 ${items.size} 项"
+            _message.value = UiMessage("已删除 ${items.size} 项", undoable = true)
         }
     }
 
-    fun undoDelete(item: HomeworkItem) {
-        viewModelScope.launch {
-            repo.restore(item.id)
-            _message.value = "已恢复"
-        }
-    }
-
-    /** 撤销批量删除：一次性恢复全部 id，文案按条数生成。 */
+    /**
+     * 撤销删除：单条删除就是长度为 1 的批量，共用这条通道。
+     *
+     * 不为单条另开一个 `undoDelete(item)` —— 两条撤销路径意味着两份「撤销后该提示什么」
+     * 的文案逻辑，而它们迟早会漂移（AGENTS.md §6.4）。
+     */
     fun undoDeleteBatch(items: List<HomeworkItem>) {
         if (items.isEmpty()) return
         viewModelScope.launch {
             repo.restoreBatch(items.map { it.id })
-            _message.value = "已恢复 ${items.size} 项"
+            _message.value = UiMessage("已恢复 ${items.size} 项")
         }
     }
 
@@ -202,13 +256,13 @@ class HomeworkViewModel(private val repo: HomeworkRepository) : ViewModel() {
             is HomeworkJsonParser.Result.Success -> {
                 viewModelScope.launch {
                     val (inserted, skipped) = repo.import(result.items)
-                    if (inserted == 0 && skipped > 0) {
-                        _message.value = "全部 $skipped 条都已在清单中，没有新增"
-                    } else if (skipped > 0) {
-                        _message.value = "成功导入 $inserted 条，跳过 $skipped 条重复作业"
-                    } else {
-                        _message.value = "成功导入 $inserted 条作业"
-                    }
+                    _message.value = UiMessage(
+                        when {
+                            inserted == 0 && skipped > 0 -> "全部 $skipped 条都已在清单中，没有新增"
+                            skipped > 0 -> "成功导入 $inserted 条，跳过 $skipped 条重复作业"
+                            else -> "成功导入 $inserted 条作业"
+                        }
+                    )
                     // 跳转到被导入的日期（取第一个）
                     result.dates.firstOrNull()?.let { _selectedDate.value = it }
                     onSuccess()
@@ -227,12 +281,14 @@ class HomeworkViewModel(private val repo: HomeworkRepository) : ViewModel() {
     fun loadSampleData() {
         viewModelScope.launch {
             val (inserted, skipped) = repo.import(SampleData.build())
-            _message.value = when {
-                inserted > 0 && skipped > 0 -> "已加载 $inserted 条示例数据，跳过 $skipped 条重复"
-                inserted > 0 -> "已加载 $inserted 条示例数据"
-                // 理论上不应该走到这里（清单里已有这 7 条未删除的示例数据）
-                else -> "示例数据已在清单中"
-            }
+            _message.value = UiMessage(
+                when {
+                    inserted > 0 && skipped > 0 -> "已加载 $inserted 条示例数据，跳过 $skipped 条重复"
+                    inserted > 0 -> "已加载 $inserted 条示例数据"
+                    // 理论上不应该走到这里（清单里已有这 7 条未删除的示例数据）
+                    else -> "示例数据已在清单中"
+                }
+            )
             _selectedDate.value = todayString()
         }
     }

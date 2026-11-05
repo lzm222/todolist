@@ -43,11 +43,16 @@ app/src/main/java/io/github/lzm222/todolist/
 └── ui/
     ├── HomeworkViewModel.kt     状态聚合 + 文案生成（唯一允许拼文案的地方）
     └── screens/
-        ├── HomeworkScreen.kt          LazyColumn 骨架、Snackbar、日期条、空态、Skill 卡
-        ├── TodayListSection.kt        当日分组列表
-        ├── OverdueSection.kt          逾期栏
-        ├── HomeworkItemRow.kt         单行：勾选完成 / 滑动删除
-        └── ImportDialog.kt            导入弹窗（含 AssitTool）
+        ├── HomeworkScreen.kt         只做状态归属与事件转发（+ Content / DateBar / SectionHeader）
+        ├── RowInteraction.kt         行级交互状态机：展开 / 拖动 / 多选集合（UI 层私有）
+        ├── HomeworkTopBar.kt         HomeworkTopBar + SelectionTopBar + prettyDate / dateChipLabel
+        ├── TodayListSection.kt       当日分组列表
+        ├── OverdueSection.kt         逾期栏
+        ├── HomeworkItemRow.kt        单行：勾选完成 / 滑动删除（+ InteractiveHomeworkRow 包装）
+        ├── ImportDialog.kt           导入弹窗（含 AssitTool）
+        ├── HomeworkDialogs.kt        批量删除二次确认
+        ├── SkillCard.kt              Skill 安装状态卡（状态由外部注入）
+        └── EmptyState.kt             空态（LazyColumn 里的一段）
 ```
 
 分层红线：
@@ -58,8 +63,11 @@ app/src/main/java/io/github/lzm222/todolist/
 - **Composable 只渲染**。UI 层**不出现硬编码色值**，一律 `MaterialTheme.colorScheme.*`。
 - 新增数据流请走 `Flow`（`observeByDate` → `flatMapLatest` → `combine` → `stateIn`），不要引入一次性 `suspend` 查询再手工刷新。
 - **多选/展开等交互状态属于 UI 层私有状态，不进 ViewModel**。`selectionMode`、`selectedIds`、`revealedId`、
-  `showBatchConfirm`、`lastDeleted` 全部用 `HomeworkScreen` 里的 `remember { mutableStateOf(...) }` 持有。
+  `draggingId` 四份收在一个 `RowInteraction` 里（`remember { RowInteraction() }` 持有），
+  `showImport`、`showBatchConfirm`、`lastDeleted` 就地持有。
   它们一旦进 `UiState`，就会给 `combine` 增加与数据无关的同步点，并把「全选范围」与「当前可见行」解耦。
+  `RowInteraction` 只是**改变了携带方式**（从 4 份散装 state + 4 个手写回调变成自带方法的状态机），
+  红线没有变：不进 ViewModel、不进 `UiState`、不参与 `combine`。
 - `UiState` 里允许出现**派生属性**（如 `selectableIds`、`allItems`）：用 getter 从既有字段算出，
   不新增字段、不新增 `combine` 输入。它们的存在理由是「全选必须与可见行一致」，而不是缓存。
 
@@ -251,6 +259,26 @@ val isEmpty get() = if (isToday) groups.isEmpty() && overdue.isEmpty()
 
 `availableDates` 在 `combine` 中拼为 `(dates + todayStr).distinct().sortedDescending()`——**今天始终可选**。
 
+**「今天」必须由 `todayFlow` 驱动，不能在变换函数里现算。** `combine` 的变换函数只在上游有新值时才执行，
+在里面调 `LocalDate.now()` 等于把「当时那一刻」固化成常量：手机跨过午夜后日期条不动、逾期天数也不变，
+必须杀进程才恢复。现行实现是：
+
+```kotlin
+private val todayFlow: StateFlow<String> = flow {
+    while (true) {
+        val today = LocalDate.now()
+        emit(today.format(iso))
+        val waitMs = ChronoUnit.MILLIS.between(LocalDateTime.now(), today.plusDays(1).atStartOfDay())
+        delay(waitMs.coerceAtLeast(1_000L) + 1_000L)   // 到下个午夜 +1s
+    }
+}.distinctUntilChanged().stateIn(viewModelScope, SharingStarted.Eagerly, todayString())
+```
+
+两个细节不要改：`SharingStarted.Eagerly`（跨午夜刷新不能依赖「有没有人订阅」）、
+`+1_000L`（避免刚好卡在午夜边界上取到前一天）。`overdueItems` 走 `todayFlow.flatMapLatest`，
+`combine` 接收 `todayStr` 后逾期天数一律 `LocalDate.parse(todayStr, iso)`——**同一个数据源、同一次快照**，
+否则会出「列表按旧日期筛、天数按新日期算」的错位。
+
 ### 6.4 完成 ≠ 滑开 ≠ 删除（三件事必须分开）
 
 - **勾选**：`isDone` 置位，条目**留在原地**，划线 + 灰化。
@@ -258,8 +286,11 @@ val isEmpty get() = if (isToday) groups.isEmpty() && overdue.isEmpty()
 - **删除**：只有用户**点击**背景那个删除按钮才调 `onDelete`，`deleted` 置位，Snackbar 提供「撤销」。
 - **右滑不响应**：位移被钳在 `coerceAtMost(0)`，锚点全为非正值，向右拖动无任何位移。
 - **批量删除**：长按进入多选 → 标题栏换成 `SelectionTopBar` → 删除图标弹 `BatchDeleteConfirmDialog` 二次确认 → `viewModel.deleteBatch(targets)`。
-- 撤销判定靠 `msg.startsWith("已删除")`；`lastDeleted` 的类型是 `List<HomeworkItem>`，**非删除类消息必须清空它**，防止误撤销上一条。
-- 单条删除与批量删除共用 `undoDeleteBatch`（长度 1 的批量）。不要为单条另开一条撤销通道。
+- 撤销判定靠消息自带的 `UiMessage.undoable`，**不再**用 `msg.startsWith("已删除")` 那种隐式协议：
+  靠文案前缀判断，改一次措辞撤销按钮就静默消失。`lastDeleted` 的类型是 `List<HomeworkItem>`，
+  **非删除类消息必须清空它**，防止误撤销上一条。
+- 单条删除与批量删除共用 `undoDeleteBatch`（长度 1 的批量）。不要为单条另开一条撤销通道
+  （`undoDelete(item)` 已删除，就是为了不留第二条文案路径）。
 
 ### 6.5 滑开只是展开，绝不能「滑开即删」或「滑到头」
 
@@ -376,6 +407,14 @@ val isEmpty get() = if (isToday) groups.isEmpty() && overdue.isEmpty()
   **比较对象必须读 `rememberUpdatedState`**（`currentIsRevealed.value`）：该 effect 的 key
   只有 `state`，直接读闭包里的 `isRevealed` 会永远停在首次组合值（通常 `false`），
   结果是「关掉了却不回报 `false`」，父层 `revealedId` 一直残留（v1.7.2 顺手修的）。
+- **背景按钮的「铺满整行」必须用 `matchParentSize()`，不能用 `fillMaxHeight()`**：
+  行的外层是 `Box(... .heightIn(min = 56.dp))`，而它作为 `LazyColumn` 的子项，收到的
+  `maxHeight` 是 **∞**。`fillMaxHeight()` 在无限约束下直接退化成「不生效」，背景于是按自身
+  内容高度（约 56dp）定位 —— 作业文案一换行把行撑高，红色删除条就比整行矮一截。
+  `matchParentSize()` 由 `Box` 在量完其余子项、确定自身尺寸之后以**确定尺寸**再测一次，
+  既铺满整行又不参与父 Box 的尺寸计算（不会把行撑大）。所以 `DeleteBackground` 是
+  「外层 `modifier`（= matchParentSize）铺满 + 内层 88dp `fillMaxHeight`」两层结构，
+  外层的「铺满高度」与内层的「只占 88dp」互不干扰。
 - **背景按钮可用性**：`enabled = state.settledValue == RowAnchor.Open`，
   只有真正停靠在展开锚点后才可点，避免动画途中误触。
 - 展开是**互斥**的：`HomeworkScreen` 用 `revealedId: Long?` 保存唯一展开行的 id，
@@ -447,7 +486,7 @@ Row(
 7. 大改动前建议先备份到 `.fixbak/todolist-<HHMMSS>/`（现有基线：`.fixbak/todolist-172157/`）。
 8. `git add -A && git commit`，**一个 Bug 一次提交**，见 §8.1。
 
-交付目录现状（均为 20,387,672 字节）：`v1.0` / `v1.1` / `v1.2` / `v1.3` / `v1.4` / `v1.5` / `v1.6` / `v1.6.1` / `v1.6.2` / `v1.6.3` / `v1.7` / `v1.7.1` / `v1.7.2`。
+交付目录现状（均为 20,387,672 字节）：`v1.0` / `v1.1` / `v1.2` / `v1.3` / `v1.4` / `v1.5` / `v1.6` / `v1.6.1` / `v1.6.2` / `v1.6.3` / `v1.7` / `v1.7.1` / `v1.7.2` / `v1.8`。
 - v1.6 的 MD5 为 `6a2a556671625e4240c8a2357292a3cd`（滑动删除改为 `anchoredDraggable` 实现）。
 - v1.6.1 的 MD5 为 `0c782dadd44e89cf61b867fdfe6e072b`（修复首帧 `Cannot round NaN value` 崩溃）。
 - v1.6.2 的 MD5 为 `43d6f794890015490e6026ea264d4103`（修复 `progress` 符号导致删除按钮隐形）。
@@ -455,11 +494,15 @@ Row(
 - v1.7 的 MD5 为 `fde6ffd1f9093646a1113dec41d9a59b`（起手即互斥 + 多指物理禁用）。
 - v1.7.1 的 MD5 为 `29c48a99708a111aa09f892100c3557f`（修复展开态右滑无法关闭）。
 - v1.7.2 的 MD5 为 `4f41b507933ac546e204bd6edb49fc92`（修复右滑被误判为左滑、抽屉自己滑开）。
+- v1.8 的 MD5 为 `b6ac6e549aa63d7bbc4f8fdb68a7164a`（UI 层拆分 + 跨午夜/分组排序/撤销协议/删除条高度四处修复）。
 
 ### 8.1 版本控制约定
 
 仓库根即本工作区根，`git init -b main` 建立，首次提交 `7c56e59`
-（`chore: 初始化版本控制，纳入 v1.4 基线`，56 文件 / 4102 行）。**当前无 remote，纯本地仓库。**
+（`chore: 初始化版本控制，纳入 v1.4 基线`，56 文件 / 4102 行）。
+v1.8 重构提交（subject 含 `（v1.8）`）用 `git log --grep v1.8` 定位——
+**这里刻意不写死哈希和行数**，因为提交一旦 `--amend`，写死的数字立刻失效。
+**当前无 remote，纯本地仓库。**
 
 本地配置（**全部是本仓库级，刻意没用 `--global`**，换机器不会串味）：
 
@@ -532,11 +575,14 @@ git status --short    # 期望空输出
 | 用分批计时判断构建优化是否生效 | 先测完 A 再测完 B 会把「时间段差异」当成「配置差异」。proot 下同一配置耗时在 12s～243s 间漂移，**必须 A/B 交替、每组 ≥6 轮取中位数**。本项目就因此误报过「快 46%」，真实值约 13%。见 §3.1。 |
 | 多选状态塞进 ViewModel | 选中集合是纯 UI 私有状态，进 UiState 会给 `combine` 增加无意义同步点，还会让「全选范围」与可见行脱钩。见 §2。 |
 | 全选按全库算而不是按可见行算 | 逾期栏在历史日期不渲染，此时不该被全选选中。`selectableIds` 已按 `isToday` 分支处理，别改成平铺。见 §6.4。 |
+| 用 `fillMaxHeight()` 铺满行背景 | 行的外层是 `Box(heightIn(min = 56.dp))`，作为 `LazyColumn` 子项收到的 `maxHeight` 是 ∞，`fillMaxHeight()` 在无限约束下退化为不生效，背景只有自身内容高度。必须用 `matchParentSize()`。见 §6.5。 |
+| 用 `message.startsWith("已删除")` 判断可撤销 | 隐式协议，改一次措辞撤销按钮就静默失效。用 `UiMessage.undoable`。见 §6.4。 |
+| 在 `combine` 的变换函数里调 `LocalDate.now()` | `combine` 只在上游有新值时才执行变换，函数里调 `now()` 等于把「那一刻」常量固化，跨午夜不刷新。要用 `todayFlow` 显式 emit 日期。见 §6.3。 |
 | 往仓库里漏提交 `app/build` 或 `local.properties` | `app/build` 有 97M，`local.properties` 含 `/root/Android` 机器路径。`git add -A` 前先 `git status --short` 扫一眼，或用 `git add -A --dry-run` 预检。见 §8.1。 |
 
 ---
 
 ## 10. 一句话原则
 
-> **完成与删除分离、唯一性靠部分索引、空态嵌在列表里、命中区等于视觉区、文案只在 ViewModel、滑开只露按钮。**
-> 这六条是这个项目全部修复历史的沉淀，改任何一处之前先确认不会破坏它们。
+> **完成与删除分离、唯一性靠部分索引、空态嵌在列表里、命中区等于视觉区、文案只在 ViewModel、滑开只露按钮、日期由 flow 驱动。**
+> 这七条是这个项目全部修复历史的沉淀，改任何一处之前先确认不会破坏它们。

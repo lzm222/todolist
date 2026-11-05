@@ -62,6 +62,42 @@ private val DeleteButtonWidth = 88.dp
 private enum class RowAnchor { Settled, Open }
 
 /**
+ * 把 [RowInteraction] 与纯展示的 [HomeworkItemRow] 接起来的一层薄包装。
+ *
+ * 存在的意义只有一个：让「从 rowUi 里取状态、把回调写回 rowUi」这套翻译只写一遍。
+ * 当日清单和逾期栏都要渲染同一种行，如果各自手写这 8 个参数，迟早会漏掉一个
+ * （漏掉 `dragEnabled` 就是多指同拖失效，漏掉 `onRevealChange` 就是抽屉永远不互斥）。
+ *
+ * [HomeworkItemRow] 本身仍然是无状态叶子组件：它只收值、只调回调，
+ * 不知道 [RowInteraction] 的存在，也不关心谁持有它。
+ */
+@Composable
+internal fun InteractiveHomeworkRow(
+    item: HomeworkItem,
+    rowUi: RowInteraction,
+    onToggleDone: () -> Unit,
+    onDelete: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    HomeworkItemRow(
+        item = item,
+        onToggleDone = onToggleDone,
+        onDelete = onDelete,
+        modifier = modifier,
+        isRevealed = rowUi.revealedId == item.id,
+        onRevealChange = { open -> rowUi.onRevealChange(item.id, open) },
+        // 别的行正在被拖时物理禁用本行的拖拽：
+        // 这是唯一能杜绝「两指同时拉开两个抽屉」的手段（状态收敛总有延迟）
+        dragEnabled = rowUi.draggingId == null || rowUi.draggingId == item.id,
+        onDragStateChange = { dragging -> rowUi.onDragStateChange(item.id, dragging) },
+        selectionMode = rowUi.selectionMode,
+        isSelected = item.id in rowUi.selectedIds,
+        onToggleSelect = { rowUi.toggleSelect(item) },
+        onLongPress = { rowUi.longPress(item) },
+    )
+}
+
+/**
  * 单条作业。
  * - 勾选 = 完成（保留在同一列表，划线 + 灰化），**不是删除**
  * - 左滑 = **仅露出删除按钮**，行最多位移 [DeleteButtonWidth]；点击按钮才真正删除
@@ -243,9 +279,18 @@ fun HomeworkItemRow(
         contentAlignment = Alignment.CenterEnd,
     ) {
         // 背景按钮：随拖动进度淡入，只占按钮宽度那一条。
+        //
+        // 必须用 matchParentSize() 而不是 fillMaxHeight()：
+        // LazyColumn 给子项的 maxHeight 是**无限**，而 fillMaxHeight 在无限约束下
+        // 直接退化成「不生效」——背景的高度于是退化为自身内容高度（约 56dp），
+        // 一旦作业文案换行把行撑高，红色删除条就比整行矮一截，露出上方/下方一条底色。
+        // matchParentSize 会在父 Box 量完其余子项、确定自身尺寸之后，再以**确定尺寸**
+        // 测量它，于是背景恒等于整行高度，且不参与父 Box 的尺寸计算（不会把行撑大）。
+        //
         // 传 state 而不是 progress：让 offset 的读取发生在 graphicsLayer 的
         // 绘制阶段 lambda 里，避免拖动期间触发重组。
         DeleteBackground(
+            modifier = Modifier.matchParentSize(),
             state = state,
             buttonWidthPx = buttonWidthPx,
             enabled = state.settledValue == RowAnchor.Open,
@@ -293,6 +338,7 @@ fun HomeworkItemRow(
  */
 @Composable
 private fun DeleteBackground(
+    modifier: Modifier = Modifier,
     state: AnchoredDraggableState<RowAnchor>,
     buttonWidthPx: Float,
     enabled: Boolean,
@@ -306,38 +352,45 @@ private fun DeleteBackground(
         else (-raw / buttonWidthPx).coerceIn(0f, 1f)
     }
 
+    // 外层铺满整行（由调用方以 matchParentSize 提供确定尺寸），
+    // 内层才是 88dp 宽的按钮条 —— 这样「铺满高度」和「只占按钮宽度」两件事互不干扰。
     Box(
-        modifier = Modifier
-            .width(DeleteButtonWidth)
-            .fillMaxHeight()
-            .graphicsLayer { alpha = progressOf() }
-            .background(MaterialTheme.colorScheme.errorContainer),
+        modifier = modifier,
         contentAlignment = Alignment.CenterEnd,
     ) {
-        Row(
+        Box(
             modifier = Modifier
                 .width(DeleteButtonWidth)
                 .fillMaxHeight()
-                .padding(vertical = 2.dp)
-                .clip(MaterialTheme.shapes.small)
-                .background(MaterialTheme.colorScheme.error)
-                .clickable(enabled = enabled, onClick = onDelete)
-                .padding(horizontal = 4.dp, vertical = 8.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.Center,
+                .graphicsLayer { alpha = progressOf() }
+                .background(MaterialTheme.colorScheme.errorContainer),
+            contentAlignment = Alignment.CenterEnd,
         ) {
-            Icon(
-                imageVector = Icons.Rounded.Delete,
-                contentDescription = null,
-                tint = MaterialTheme.colorScheme.onError,
-                modifier = Modifier.size(20.dp),
-            )
-            Text(
-                text = "删除",
-                style = MaterialTheme.typography.labelLarge,
-                color = MaterialTheme.colorScheme.onError,
-                modifier = Modifier.padding(start = 4.dp),
-            )
+            Row(
+                modifier = Modifier
+                    .width(DeleteButtonWidth)
+                    .fillMaxHeight()
+                    .padding(vertical = 2.dp)
+                    .clip(MaterialTheme.shapes.small)
+                    .background(MaterialTheme.colorScheme.error)
+                    .clickable(enabled = enabled, onClick = onDelete)
+                    .padding(horizontal = 4.dp, vertical = 8.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.Center,
+            ) {
+                Icon(
+                    imageVector = Icons.Rounded.Delete,
+                    contentDescription = null,
+                    tint = MaterialTheme.colorScheme.onError,
+                    modifier = Modifier.size(20.dp),
+                )
+                Text(
+                    text = "删除",
+                    style = MaterialTheme.typography.labelLarge,
+                    color = MaterialTheme.colorScheme.onError,
+                    modifier = Modifier.padding(start = 4.dp),
+                )
+            }
         }
     }
 }
