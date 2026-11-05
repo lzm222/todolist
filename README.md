@@ -168,10 +168,27 @@ chmod +x ./setup_android_env.sh
 | 问题 | 原因 | 修复 |
 | --- | --- | --- |
 | 左滑之后整行直接滑到头，看不到删除按钮 | v1.5 用的 `SwipeToDismissBox` 语义是**二态吸附**：只有「归位」和「已 dismiss」两个停靠位，一旦越过阈值就吸附到 dismiss 位置——而那是个**整行滑出屏幕**的位移，库本身没有「停在任意偏移量」的概念。所以无论阈值调多大，只要过了阈值就必然滑到头，背景按钮露出一瞬就被带走了 | 换掉手势底层，改用 `AnchoredDraggableState` + `Modifier.anchoredDraggable` 自控位移：定义两个锚点 `Settled at 0f` 与 `Open at -buttonWidthPx`（88dp），`Open` 的位移**恰好等于按钮宽度**，于是「滑开」的终点在物理上就等于「只露按钮」，越不过去。阈值与动画规格挂到 `AnchoredDraggableDefaults.flingBehavior(..)` 上（`positionalThreshold = { it * 0.5f }`，即行程过半才吸附） |
-| 向右滑仍然会带动行 | 手势库默认双向可用 | 前景位移用 `Modifier.offset { IntOffset(state.offset.roundToInt().coerceAtMost(0), 0) }` 把偏移强制钳在 ≤ 0，配合锚点全为非正值，向右拖动无任何位移 |
+| 向右滑仍然会带动行 | 手势库默认双向可用 | 前景位移在 `Modifier.offset { }` 里把偏移强制钳在 ≤ 0（`coerceAtMost(0)`），配合锚点全为非正值，向右拖动无任何位移 |
 | 背景按钮在行没完全展开时就能点到 | 背景层只是铺在下面，没有跟随展开进度做可用性约束 | 按钮 `enabled = state.settledValue == RowAnchor.Open`，只有真正停靠在展开锚点后才可点；同时按 `PROGRESS = offset / buttonWidthPx` 驱动背景淡入，展开过程视觉连续 |
-
 > 对外签名未变（`isRevealed` / `onRevealChange` 照旧），因此 `TodayListSection`、`OverdueSection`、`HomeworkScreen` 一行未改；展开互斥仍由父层 `revealedId: Long?` 统一管理，收起分支按 id 比对，防止旧行的延迟回调清掉新行的展开态。
+
+### v1.6.1 修复说明
+
+| 问题 | 原因 | 修复 |
+| --- | --- | --- |
+| 装上 v1.6 后，一进列表或一左滑就闪退（`java.lang.IllegalArgumentException: Cannot round NaN value`，崩在 `HomeworkItemRow.kt` 的 `Modifier.offset` lambda 里） | `AnchoredDraggableState` 的锚点原先靠 `LaunchedEffect(buttonWidthPx) { state.updateAnchors(...) }` 建立，而**首帧布局早于 `LaunchedEffect`**，在那之前 `state.offset` 是 `NaN`。此时 `Modifier.offset { }` 的 lambda 直接 `roundToInt()`，`Math.round(NaN)` 抛异常。v1.6 只给 `progress` 加了 `isNaN` 判断，漏了 `offset`——两者不是同一个求值路径：`progress` 在**组合期**算，`offset` 的 lambda 在**布局阶段**每帧独立求值 | 双层修复：① **源头**——锚点改为在组合期随状态一起构造（`remember(buttonWidthPx) { AnchoredDraggableState(initialValue, anchors = DraggableAnchors { ... }) }`），首帧即有锚点，`offset` 不再是 `NaN`，并删掉 `updateAnchors` 那条 effect；② **兜底**——`offset` 的 lambda 内部也判 `isNaN`，为 0 时按 `0` 处理。两处都保留，因为它们求值时机不同，只护一处不解决问题 |
+
+> 这是 v1.6 的收尾修复，未改任何交互语义：滑开仍只露 88dp 按钮、仍不写数据库、向右仍无响应、展开互斥与撤销通道全部照旧。对外签名与文件结构零改动，只动 `HomeworkItemRow.kt` 一个文件。
+
+### v1.6.1 回归验证
+
+- [x] 冷启动后直接进入列表（含无任何作业的空态）→ 不再闪退
+- [x] 首次左滑任意一行 → 正常露出删除按钮，不崩
+- [x] 滑开 → 点删除 → 撤销，全流程无崩溃
+- [x] 深色/浅色切换、字体缩放变化（触发密度/宽度重算）后左滑 → 锚点重建正确，不崩
+- [x] 上下快速滚动（横向漂移）→ 无展开残留、无崩溃
+- [x] 全项目 grep `roundToInt|toInt()` → 仅 `HomeworkJsonParser`/`HomeworkViewModel` 各一处普通 `toInt`（有 `runCatching` 兜底），无其他 NaN 入口
+
 
 ### v1.4 修复说明
 

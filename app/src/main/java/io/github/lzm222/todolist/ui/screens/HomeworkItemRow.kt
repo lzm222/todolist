@@ -89,8 +89,19 @@ fun HomeworkItemRow(
     val density = LocalDensity.current
     val buttonWidthPx = with(density) { DeleteButtonWidth.toPx() }
 
-    val state: AnchoredDraggableState<RowAnchor> = remember {
-        AnchoredDraggableState(initialValue = RowAnchor.Settled)
+    // 锚点必须**在组合期就建立**，不能只放在 LaunchedEffect 里：
+    // 首帧布局早于 LaunchedEffect 执行，那之前 state.offset 是 NaN，
+    // 而 Modifier.offset 的 lambda 会在布局阶段直接读它 → roundToInt() 崩溃。
+    // 用 remember(buttonWidthPx) 保证同一帧内构造好锚点，密度变化时重建。
+    val state: AnchoredDraggableState<RowAnchor> = remember(buttonWidthPx) {
+        AnchoredDraggableState(
+            initialValue = RowAnchor.Settled,
+            anchors = DraggableAnchors {
+                RowAnchor.Settled at 0f
+                // Open 位移 = -按钮宽度，这就是「只露按钮」的保证
+                RowAnchor.Open at -buttonWidthPx
+            },
+        )
     }
     // 阈值与动画规格按官方建议挂在 flingBehavior 上，而不是 state 构造器（后者已弃用）
     val flingBehavior = AnchoredDraggableDefaults.flingBehavior(
@@ -98,14 +109,6 @@ fun HomeworkItemRow(
         positionalThreshold = { distance: Float -> distance * 0.5f },
         animationSpec = AnchoredDraggableDefaults.SnapAnimationSpec,
     )
-    // 锚点随按钮宽度变化重建；Open 位移 = -按钮宽度，这就是「只露按钮」的保证
-    LaunchedEffect(buttonWidthPx) {
-        val newAnchors = DraggableAnchors {
-            RowAnchor.Settled at 0f
-            RowAnchor.Open at -buttonWidthPx
-        }
-        state.updateAnchors(newAnchors, state.currentValue)
-    }
 
     // 展开态互斥：父层收起了我 / 别人展开了 / 进入多选 → 复位
     LaunchedEffect(isRevealed, selectionMode) {
@@ -126,7 +129,11 @@ fun HomeworkItemRow(
         }
     }
 
-    val progress = if (state.offset.isNaN()) 0f else (state.offset / buttonWidthPx)
+    // 锚点已在构造期建立，理论上不会再有 NaN；但布局阶段仍可能读到未就绪的
+    // State 快照，所以 progress 与 offset 两处都保留独立防护。
+    // 这不是冗余：progress 在组合期算，offset 在布局期算，是两条不同的求值路径。
+    val offsetPx = state.offset
+    val progress = if (offsetPx.isNaN()) 0f else (offsetPx / buttonWidthPx)
 
     Box(
         modifier = modifier
@@ -145,7 +152,12 @@ fun HomeworkItemRow(
         Box(
             modifier = Modifier
                 .fillMaxWidth()
-                .offset { IntOffset(state.offset.roundToInt().coerceAtMost(0), 0) }
+                .offset {
+                    // lambda 内独立防守：布局阶段可能先于锚点就绪执行
+                    val raw = state.offset
+                    val dx: Int = if (raw.isNaN()) 0 else raw.roundToInt().coerceAtMost(0)
+                    IntOffset(dx, 0)
+                }
                 .anchoredDraggable(
                     state = state,
                     orientation = Orientation.Horizontal,

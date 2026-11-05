@@ -240,7 +240,12 @@ val isEmpty get() = if (isToday) groups.isEmpty() && overdue.isEmpty()
   「只露出 88dp 按钮」，**天然越不过去**。不要把它改成屏幕宽度或其它魔数。
 - **`anchoredDraggable` 的参数组合（已验证可编译、零 warning）**：
   ```kotlin
-  val state: AnchoredDraggableState<RowAnchor> = remember { AnchoredDraggableState(initialValue = RowAnchor.Settled) }
+  val state: AnchoredDraggableState<RowAnchor> = remember(buttonWidthPx) {
+      AnchoredDraggableState(                                        // 锚点必须在组合期就建好，见下方条目
+          initialValue = RowAnchor.Settled,
+          anchors = DraggableAnchors { RowAnchor.Settled at 0f; RowAnchor.Open at -buttonWidthPx },
+      )
+  }
   val flingBehavior = AnchoredDraggableDefaults.flingBehavior(   // 是 @Composable，不能包在 remember 里
       state = state,
       positionalThreshold = { distance: Float -> distance * 0.5f },  // 行程过半才吸附
@@ -256,13 +261,30 @@ val isEmpty get() = if (isToday) groups.isEmpty() && overdue.isEmpty()
 - **不要走带阈值参数的顶层工厂函数**：它与类构造器同名、会产生解析歧义，
   且必须同时补齐 `snapAnimationSpec` / `decayAnimationSpec` 两个必填参数，
   否则报 `Cannot infer type for type parameter 'T'`。用简单构造器 + `flingBehavior` 即可。
-- **位移渲染必须钳制**：`Modifier.offset { IntOffset(state.offset.roundToInt().coerceAtMost(0), 0) }`。
-  `coerceAtMost(0)` 就是「右滑无响应」的实现，别删。
-- **NaN 防护**：首帧锚点还没建立时 `state.offset` 为 `NaN`，
-  计算 `progress` 先判 `if (state.offset.isNaN()) 0f else ...`，否则背景 alpha 会崩。
-- **锚点随宽度重建**：`LaunchedEffect(buttonWidthPx)` 里用
-  `DraggableAnchors { RowAnchor.Settled at 0f; RowAnchor.Open at -buttonWidthPx }`
-  调 `state.updateAnchors(newAnchors, state.currentValue)`。
+- **位移渲染必须钳制**：`Modifier.offset { }` 里必须写 `coerceAtMost(0)`。
+  `coerceAtMost(0)` 就是「右滑无响应」的实现，别删。完整写法见下方 NaN 条目。
+- **锚点必须在组合期建立**：用 `AnchoredDraggableState(initialValue, anchors = DraggableAnchors {...})`
+  直接构造，或 `remember(buttonWidthPx) { ... }`。**不要**只靠 `LaunchedEffect` 里的 `updateAnchors`：
+  首帧布局早于 `LaunchedEffect`，那之前 `state.offset` 是 `NaN`。
+- **NaN 防护必须写在两处，且不能只护一处**：`Modifier.offset { }` 的 lambda 在**布局阶段**
+  每帧独立求值，与组合期算出的 `progress` 是两条不同的求值路径。
+  只护 `progress` 而让 `offset` 裸调 `roundToInt()` 会直接崩：
+  `IllegalArgumentException: Cannot round NaN value`（v1.6 线上就踩了这个）。
+  ```kotlin
+  // 组合期
+  val offsetPx = state.offset
+  val progress = if (offsetPx.isNaN()) 0f else (offsetPx / buttonWidthPx)
+  // 布局期：注意两个分支类型必须一致，否则报 Argument type mismatch
+  Modifier.offset {
+      val raw = state.offset
+      val dx: Int = if (raw.isNaN()) 0 else raw.roundToInt().coerceAtMost(0)
+      IntOffset(dx, 0)
+  }
+  ```
+- **锚点重建由 `remember(buttonWidthPx)` 承担**：宽度（密度）变化时 key 变化，
+  整份 `AnchoredDraggableState` 连同锚点一起重建，不需要也不应该再补
+  `LaunchedEffect { state.updateAnchors(...) }`。当前实现里**已无** `updateAnchors` 调用。
+  若将来出现「状态必须跨宽度存活」的需求，才考虑补 effect，且必须保留组合期构造作为兜底。
 - **展开/收起由 `isRevealed` 单向驱动**：`LaunchedEffect(isRevealed, selectionMode)` 里
   `shouldOpen = isRevealed && !selectionMode` → `animateTo(Open / Settled)`。
   行**允许长期停在 `Open`**，这是「等用户再点按钮」的载体。
@@ -340,8 +362,9 @@ Row(
 7. 大改动前建议先备份到 `.fixbak/todolist-<HHMMSS>/`（现有基线：`.fixbak/todolist-172157/`）。
 8. `git add -A && git commit`，**一个 Bug 一次提交**，见 §8.1。
 
-交付目录现状（均为 20,387,672 字节）：`v1.0` / `v1.1` / `v1.2` / `v1.3` / `v1.4` / `v1.5` / `v1.6`。
-v1.6 的 MD5 为 `6a2a556671625e4240c8a2357292a3cd`（滑动删除改为 `anchoredDraggable` 实现）。
+交付目录现状（均为 20,387,672 字节）：`v1.0` / `v1.1` / `v1.2` / `v1.3` / `v1.4` / `v1.5` / `v1.6` / `v1.6.1`。
+- v1.6 的 MD5 为 `6a2a556671625e4240c8a2357292a3cd`（滑动删除改为 `anchoredDraggable` 实现）。
+- v1.6.1 的 MD5 为 `0c782dadd44e89cf61b867fdfe6e072b`（修复首帧 `Cannot round NaN value` 崩溃）。
 
 ### 8.1 版本控制约定
 
@@ -399,7 +422,9 @@ git status --short    # 期望空输出
 | 给 `AnchoredDraggableState` 工厂函数只传 `initialValue` | 会报 `Cannot infer type for type parameter 'T'`——工厂函数还需 `snapAnimationSpec` / `decayAnimationSpec` 两个必填参数。用简单构造器 + `flingBehavior` 更省事。见 §6.5。 |
 | `flingBehavior` 包进 `remember {}` | `AnchoredDraggableDefaults.flingBehavior` 是 `@Composable`，放进 `remember` lambda 里会编译失败。直接在当前 composable 作用域调用。见 §6.5。 |
 | 删掉 `offset` 里的 `coerceAtMost(0)` | 它同时承担「右滑无响应」与「位移不越界」，删了右滑就会带动行。见 §6.5。 |
-| 忘判 `state.offset.isNaN()` | 首帧锚点未建立时 offset 是 `NaN`，直接算 `progress` 会让背景 alpha 崩。见 §6.5。 |
+| 只护 `progress` 不护 `offset` | `Modifier.offset { }` 的 lambda 在**布局阶段**每帧独立求值，早于/独立于组合期的 `progress`。只给 `progress` 加 `isNaN` 判断、`offset` 裸调 `roundToInt()`，首帧直接崩 `Cannot round NaN value`。v1.6 线上事故就是这条。见 §6.5。 |
+| 用 `LaunchedEffect` 建立锚点 | 首帧布局早于 `LaunchedEffect`，那之前 `state.offset` 是 `NaN`。锚点必须用 `remember(buttonWidthPx) { AnchoredDraggableState(initialValue, anchors = ...) }` 在组合期建好。见 §6.5。 |
+| `offset` 两分支类型不一致 | `if (raw.isNaN()) 0f else raw.roundToInt()...` 会被推成 `Number & Comparable<...>`，报 `Argument type mismatch`。必须 `val dx: Int = ...` 且两分支同为 `Int`。见 §6.5。 |
 | 用 `currentValue`/`targetValue` 回写 `onRevealChange` | 动画途中值会抖动，导致展开态反复翻转。必须用 `settledValue`。见 §6.5。 |
 | 多选状态塞进 ViewModel | 选中集合是纯 UI 私有状态，进 UiState 会给 `combine` 增加无意义同步点，还会让「全选范围」与可见行脱钩。见 §2。 |
 | 全选按全库算而不是按可见行算 | 逾期栏在历史日期不渲染，此时不该被全选选中。`selectableIds` 已按 `isToday` 分支处理，别改成平铺。见 §6.4。 |
