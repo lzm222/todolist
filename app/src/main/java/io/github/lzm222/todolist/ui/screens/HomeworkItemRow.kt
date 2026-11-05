@@ -132,8 +132,12 @@ fun HomeworkItemRow(
     // 锚点已在构造期建立，理论上不会再有 NaN；但布局阶段仍可能读到未就绪的
     // State 快照，所以 progress 与 offset 两处都保留独立防护。
     // 这不是冗余：progress 在组合期算，offset 在布局期算，是两条不同的求值路径。
+    //
+    // 注意负号：offset 向左为负，区间是 [-buttonWidthPx, 0]。progress 是「展开程度」，
+    // 必须归一化到 [0, 1]，所以要取负。漏掉这个负号会让 progress 恒为负数，
+    // 后续 coerceIn(0f, 1f) 把它压成 0，删除按钮就永远不会显形。
     val offsetPx = state.offset
-    val progress = if (offsetPx.isNaN()) 0f else (offsetPx / buttonWidthPx)
+    val progress = if (offsetPx.isNaN()) 0f else (-offsetPx / buttonWidthPx).coerceIn(0f, 1f)
 
     Box(
         modifier = modifier
