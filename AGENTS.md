@@ -71,12 +71,46 @@ app/src/main/java/io/github/lzm222/todolist/
 # 首次进入环境
 chmod +x ./setup_android_env.sh && ./setup_android_env.sh
 
-# 日常构建
-./gradlew :app:assembleDebug
+# 【日常改完代码的默认校验】秒级反馈，只做 Kotlin 编译，跳过 AAPT2/dex/打包
+./gradlew :app:compileDebugKotlin 2>&1 | grep -E "^(e:|w:)|error:|BUILD"
 
-# Agent 快速验证（只看错误与结果）
+# 【交付前】出 APK（约 30s；无改动时约 8s）
 ./gradlew :app:assembleDebug 2>&1 | grep -E "^(e:|w:)|error:|BUILD"
 ```
+
+### 3.1 校验手段的选择（踩过的坑）
+
+| 手段 | 实测耗时 | 用途 |
+| --- | --- | --- |
+| `:app:compileDebugKotlin`（改动后） | **约 15s** | **每轮改完的默认校验** |
+| `:app:compileDebugKotlin`（无改动） | 约 9s | 确认没坏 |
+| `:app:assembleDebug`（改动后） | 约 30s | 交付出包 |
+| `:app:lintDebug` | **3m59s（首次）** | 交付前偶尔跑，**不要进日常循环** |
+
+三条硬性结论，别重新走一遍弯路：
+
+- **`lint` 不是编译检查**。本项目没有 ktlint / detekt，能跑的就是 AGP 的 Android Lint，
+  它查资源引用、API 兼容性、可访问性，**不做 Kotlin 类型检查**，替不了 `compileDebugKotlin`。
+  且实测 `real 4m0s` 而 `user 6.9s`——它慢在 proot 的 IO 等待，比 `assembleDebug` 差一个数量级。
+- **改完代码先跑 `compileDebugKotlin`，别直接上 `assembleDebug`**。类型不匹配、未解析引用、
+  参数签名不一致这些绝大多数错误在这一步就暴露，能省掉一半以上等待。
+- **单次计时不可信**。proot 下同一配置的耗时在 27s～92s 之间乱跳，任何「快了/慢了」的结论
+  都必须 3 次以上采样取中位数，否则就是在测量噪声。
+
+### 3.2 构建加速开关（已生效，改动前须复测）
+
+`gradle.properties` 末尾的「构建速度」段：
+
+```properties
+org.gradle.configuration-cache=true    # 实测 28s → 15s（中位），快 46%
+org.gradle.caching=false               # proot 上哈希 + 缓存目录 IO 开销远超收益
+org.gradle.parallel=false              # 单模块收益小，多 worker 抢 IO 更抖
+```
+
+- 这三项是**实测调优结果**，不是照抄官方推荐值。想改动必须先做 3 次采样对照，再改注释里的数据。
+- `caching` / `parallel` 特别容易被「优化直觉」误开，实测它们在本环境会把 15s 重新拖回 30s+。
+- `configuration-cache` 与 AGP + KSP 无冲突，日志里应出现 `Configuration cache entry stored/reused`。
+  若哪天开始报 problem，先查是不是新增了在配置阶段读环境变量的插件。
 
 必须保留的两处：
 
@@ -465,6 +499,9 @@ git status --short    # 期望空输出
 | 拖动中强行 `animateTo(Settled)` 收回 | 手势正在掌控该值，抢控制权会抖动/跳位。等 `Stop`/`Cancel` 之后再收敛。见 §6.5。 |
 | `draggingId` 没有悬空兜底 | 行在拖动中被删除时 `Stop` 不回传，`draggingId` 悬空 → **所有行永久不可拖**。父层要监听可见集合，发现 id 消失立即释放。见 §6.5。 |
 | 用 `currentValue`/`targetValue` 回写 `onRevealChange` | 动画途中值会抖动，导致展开态反复翻转。必须用 `settledValue`。见 §6.5。 |
+| 拿 `lint` 当编译检查 | 本项目无 ktlint/detekt，只有 AGP 的 Android Lint；它查资源/API/可访问性，**不做 Kotlin 类型检查**，且实测首次 3m59s（`real 4m0s` / `user 6.9s`，慢在 IO）。日常校验用 `:app:compileDebugKotlin`。见 §3.1。 |
+| 按直觉开 `caching` / `parallel` | 官方推荐值在本 proot 环境是**反效果**：build cache 的哈希与缓存目录 IO 会把 15s 拖回 30s+，多 worker 还会加剧 IO 争抢。仅 `configuration-cache=true` 实测有效（28s→15s 中位）。见 §3.2。 |
+| 用单次计时判断构建优化是否生效 | proot 下同一配置耗时在 27s～92s 间乱跳，单次测量就是测噪声。必须 ≥3 次采样取中位数再下结论。见 §3.1。 |
 | 多选状态塞进 ViewModel | 选中集合是纯 UI 私有状态，进 UiState 会给 `combine` 增加无意义同步点，还会让「全选范围」与可见行脱钩。见 §2。 |
 | 全选按全库算而不是按可见行算 | 逾期栏在历史日期不渲染，此时不该被全选选中。`selectableIds` 已按 `isToday` 分支处理，别改成平铺。见 §6.4。 |
 | 往仓库里漏提交 `app/build` 或 `local.properties` | `app/build` 有 97M，`local.properties` 含 `/root/Android` 机器路径。`git add -A` 前先 `git status --short` 扫一眼，或用 `git add -A --dry-run` 预检。见 §8.1。 |

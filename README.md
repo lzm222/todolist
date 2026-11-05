@@ -129,6 +129,34 @@ chmod +x ./setup_android_env.sh
 ```
 > `gradle.properties` 里的 `android.aapt2.process.daemon=false` 和 `build.gradle.kts` 里强制 `aapt2 ...:linux-aarch64` 的 `configurations.all` 块是 ARM64 环境的必需配置，**请勿删除**。
 
+#### 改完代码后该用哪条命令
+
+按「只想确认能不能编译」和「要出安装包」分两档，别一律上 `assembleDebug`：
+
+| 场景 | 命令 | 实测耗时（改动一行 Kotlin） |
+| --- | --- | --- |
+| 日常改完先查语法/类型 | `./gradlew :app:compileDebugKotlin` | **约 15 秒** |
+| 无改动、只想确认没坏 | `./gradlew :app:compileDebugKotlin` | 约 9 秒 |
+| 交付前出 APK | `./gradlew :app:assembleDebug` | 约 30 秒（无改动时约 8 秒） |
+
+`compileDebugKotlin` 跳过了资源合并、AAPT2、dex 和打包，绝大多数改错的反馈都比 `assembleDebug` 快一倍以上。
+
+#### 关于 lint（重要）
+
+**不要拿 `lint` 当编译检查用。** 本项目没有配置 ktlint / detekt，这里的 lint 只能是 AGP 自带的 Android Lint，它检查的是资源引用、API 兼容性、可访问性等静态质量项，不承担 Kotlin 类型检查；且首次运行实测 **3 分 59 秒**（`real 4m0s` 而 `user` 仅 `6.9s`，说明耗时几乎全耗在 proot 的 IO 等待上），比 `assembleDebug` 慢一个数量级。它适合**交付前偶尔跑一次**，不适合放进每轮修改的循环。
+
+#### 构建加速配置（已生效，勿随意改）
+
+`gradle.properties` 末尾的「构建速度」段是本环境实测调优的结果：开 `configuration-cache=true`、关 `caching=false` 与 `parallel=false`。
+
+| 开关 | 取值 | 原因 |
+| --- | --- | --- |
+| `configuration-cache` | `true` | proot 下 Gradle 配置阶段是纯 IO 等待。实测 3 次改动编译：关闭时 58/27/28s（中位 28s），开启时 15/16/15s（中位 15s），**快 46% 且极稳定** |
+| `caching` | `false` | build cache 每次任务都要对输出算哈希并读写缓存目录，这层 IO 开销在 proot 上远超收益（实测反被拖到 30s+ 甚至 90s） |
+| `parallel` | `false` | 单模块项目并行收益本就有限，proot 里多 worker 抢同一层 IO 更容易抖动；实测开关差异落在噪声内，取保守值 |
+
+> **计时方法提醒**：proot 下同一配置的耗时波动极大（27s～92s 都出现过），**单次计时不可信**。判断任何构建改动是否有效，必须多次采样取中位数。
+
 ### v1.1 修复说明
 
 | 问题 | 原因 | 修复 |
