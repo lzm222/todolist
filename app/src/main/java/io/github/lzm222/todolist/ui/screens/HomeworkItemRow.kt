@@ -138,14 +138,30 @@ fun HomeworkItemRow(
 
     // 展开态互斥：父层收起了我 / 别人展开了 / 进入多选 → 复位。
     //
-    // 关键点：如果这时我正被手指拖着，**不能**立刻 animateTo(Settled)，
-    // 否则会和手势抢控制权。改为等 isDragging 变 false（松手）后再由下面的
-    // 回调自然收敛。
+    // 这里必须把 isDragging 作为 key（拖动开始时就要让开），但**松手后不能被重跑带偏**：
+    // 若不加区分，松手瞬间 effect 会重跑，而此时父层的 isRevealed 仍是 true
+    // （收起通知还没回传）→ 又 animateTo(Open)，把用户刚右滑关掉的抽屉弹回去。
+    //
+    // 解法：拖动起手时记下当时的 isRevealed 快照（dragStartRevealed）。
+    // 松手后若 isRevealed 与快照相同，说明「父层在这轮拖动中没改主意」，
+    // 落点完全由手势决定，effect 不干预；若不同，才按父层的新意图收敛。
+    var dragStartRevealed by remember { mutableStateOf<Boolean?>(null) }
     LaunchedEffect(isRevealed, selectionMode, isDragging) {
         val shouldOpen = isRevealed && !selectionMode
         val target = if (shouldOpen) RowAnchor.Open else RowAnchor.Settled
-        // 拖动中且目标是收起 → 让手势自己先结束
-        if (!shouldOpen && isDragging) return@LaunchedEffect
+        if (isDragging) {
+            // 手势正在掌控：读与写都让开
+            return@LaunchedEffect
+        }
+        // 非拖动状态：若刚结束的一轮拖动里父层意图没变，让手势结果保留
+        val snapshot = dragStartRevealed
+        if (snapshot != null) {
+            dragStartRevealed = null
+            if (snapshot == isRevealed) {
+                // 父层没改主意 → 尊重手势落点，不覆盖
+                return@LaunchedEffect
+            }
+        }
         if (state.currentValue != target || state.targetValue != target) {
             state.animateTo(target)
         }
@@ -167,6 +183,8 @@ fun HomeworkItemRow(
             when (interaction) {
                 is DragInteraction.Start -> {
                     isDragging = true
+                    // 记下本轮拖动开始时父层的意图，供松手后判定「父层是否改过主意」
+                    dragStartRevealed = currentIsRevealed.value
                     // 上报给父层：占用「拖动中」名额，其余行随即被禁用拖拽
                     currentOnDragStateChange.value(true)
                     // 起手即占位：先让父层知道「现在是我在展开」
@@ -191,6 +209,8 @@ fun HomeworkItemRow(
             }
         }
     }
+
+    // 松手对账已合并进上面的互斥 effect（用 dragStartRevealed 快照判定），此处无需额外逻辑。
 
     // 关键：**不要**在这里读 state.offset。
     //

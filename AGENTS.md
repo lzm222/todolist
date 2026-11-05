@@ -346,6 +346,12 @@ val isEmpty get() = if (isToday) groups.isEmpty() && overdue.isEmpty()
 - **拖动中不能被强制收回**：`isDragging` 为 true 时，即便 `isRevealed` 变 false 也
   **不要**调 `animateTo(Settled)`：手势正在掌控这个值，抢控制权会抖动/跳位。
   让手势先结束（`DragInteraction.Stop` / `Cancel`），之后再收敛。
+  → 判断要写成**一律让开**（`if (isDragging) return`），不能只挡「目标为收起」。
+  只挡收起会让已展开的行右滑时被 `animateTo(Open)` 拽回，表现为「右滑关不掉」（v1.7.1）。
+- **松手后不能按 `isRevealed` 反推落点**：松手瞬间父层的 `isRevealed` 还是旧值
+  （收起通知未回传），直接 `animateTo` 会把它弹回去。用 `dragStartRevealed` 快照：
+  起手记录父层意图，松手后若 `isRevealed` 与快照相同 → 父层没改主意 → **尊重手势落点、不覆盖**；
+  不同才按新意图收敛。见 §9。
 - **`draggingId` 必须有悬空兜底**：行在拖动中被删除时 `Stop` 不会回传，
   `draggingId` 悬空会让**所有行永久不可拖**。在持有 `draggingId` 的父层里监听可见集合，
   发现该 id 已不在列表中立即释放。
@@ -428,12 +434,13 @@ Row(
 7. 大改动前建议先备份到 `.fixbak/todolist-<HHMMSS>/`（现有基线：`.fixbak/todolist-172157/`）。
 8. `git add -A && git commit`，**一个 Bug 一次提交**，见 §8.1。
 
-交付目录现状（均为 20,387,672 字节）：`v1.0` / `v1.1` / `v1.2` / `v1.3` / `v1.4` / `v1.5` / `v1.6` / `v1.6.1` / `v1.6.2` / `v1.6.3` / `v1.7`。
+交付目录现状（均为 20,387,672 字节）：`v1.0` / `v1.1` / `v1.2` / `v1.3` / `v1.4` / `v1.5` / `v1.6` / `v1.6.1` / `v1.6.2` / `v1.6.3` / `v1.7` / `v1.7.1`。
 - v1.6 的 MD5 为 `6a2a556671625e4240c8a2357292a3cd`（滑动删除改为 `anchoredDraggable` 实现）。
 - v1.6.1 的 MD5 为 `0c782dadd44e89cf61b867fdfe6e072b`（修复首帧 `Cannot round NaN value` 崩溃）。
 - v1.6.2 的 MD5 为 `43d6f794890015490e6026ea264d4103`（修复 `progress` 符号导致删除按钮隐形）。
 - v1.6.3 的 MD5 为 `dcb982c65d1897ad46ea398f8969db01`（修复组合期读 `offset` 导致的滑动卡顿）。
 - v1.7 的 MD5 为 `fde6ffd1f9093646a1113dec41d9a59b`（起手即互斥 + 多指物理禁用）。
+- v1.7.1 的 MD5 为 `29c48a99708a111aa09f892100c3557f`（修复展开态右滑无法关闭）。
 
 ### 8.1 版本控制约定
 
@@ -499,6 +506,8 @@ git status --short    # 期望空输出
 | 用 `settledValue` 做抽屉互斥 | 它只在动画停稳后更新，结果就是「新抽屉完全打开后，旧抽屉才开始关」。互斥要在 `DragInteraction.Start`（起手）时就发信号。见 §6.5。 |
 | 只靠收 `revealedId` 实现互斥 | 状态收敛永远有延迟，两指都按住不放时两个抽屉会同时停在 `Open`。必须在输入层阻断：上报 `draggingId`，其余行 `enabled = false`。见 §6.5。 |
 | 拖动中强行 `animateTo(Settled)` 收回 | 手势正在掌控该值，抢控制权会抖动/跳位。等 `Stop`/`Cancel` 之后再收敛。见 §6.5。 |
+| 互斥 effect 只挡「目标为收起」 | 判断写成 `if (!shouldOpen && isDragging) return` 时，**已展开行右滑**的 `shouldOpen` 仍为 true → `animateTo(Open)` 把用户滑动当场拽回，表现为「右滑关不掉」。必须 `if (isDragging) return` 一律让开。v1.7.1 就踩了这条。见 §6.5。 |
+| 松手后按 `isRevealed` 反推落点 | 松手瞬间父层的 `isRevealed` 还是旧值（收起通知未回传），直接 `animateTo` 会把刚关掉的抽屉弹回去。必须用 `dragStartRevealed` 快照判定父层是否改主意。v1.7.1 踩过。见 §6.5。 |
 | `draggingId` 没有悬空兜底 | 行在拖动中被删除时 `Stop` 不回传，`draggingId` 悬空 → **所有行永久不可拖**。父层要监听可见集合，发现 id 消失立即释放。见 §6.5。 |
 | 用 `currentValue`/`targetValue` 回写 `onRevealChange` | 动画途中值会抖动，导致展开态反复翻转。必须用 `settledValue`。见 §6.5。 |
 | 拿 `lint` 当编译检查 | 本项目无 ktlint/detekt，只有 AGP 的 Android Lint；它查资源/API/可访问性，**不做 Kotlin 类型检查**，且实测首次 3m59s（`real 4m0s` / `user 6.9s`，慢在 IO）。日常校验用 `:app:compileDebugKotlin`。见 §3.1。 |
