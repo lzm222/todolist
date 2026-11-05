@@ -11,6 +11,8 @@ import androidx.compose.foundation.gestures.DraggableAnchors
 import androidx.compose.foundation.gestures.Orientation
 import androidx.compose.foundation.gestures.anchoredDraggable
 import androidx.compose.foundation.gestures.animateTo
+import androidx.compose.foundation.interaction.DragInteraction
+import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Row
@@ -30,8 +32,11 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberUpdatedState
+import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -78,6 +83,11 @@ fun HomeworkItemRow(
     modifier: Modifier = Modifier,
     isRevealed: Boolean = false,
     onRevealChange: (Boolean) -> Unit = {},
+    // 是否允许拖拽。多指同拖时，父层会把除「第一根手指」外的所有行设为 false，
+    // 从物理层面杜绝同时拉开两个抽屉。
+    dragEnabled: Boolean = true,
+    // 拖动起止上报（true=起手，false=松手或取消）
+    onDragStateChange: (Boolean) -> Unit = {},
     selectionMode: Boolean = false,
     isSelected: Boolean = false,
     onToggleSelect: () -> Unit = {},
@@ -86,6 +96,7 @@ fun HomeworkItemRow(
     val currentOnDelete = rememberUpdatedState(onDelete)
     val currentOnRevealChange = rememberUpdatedState(onRevealChange)
     val currentOnLongPress = rememberUpdatedState(onLongPress)
+    val currentOnDragStateChange = rememberUpdatedState(onDragStateChange)
 
     val density = LocalDensity.current
     val buttonWidthPx = with(density) { DeleteButtonWidth.toPx() }
@@ -111,16 +122,67 @@ fun HomeworkItemRow(
         animationSpec = AnchoredDraggableDefaults.SnapAnimationSpec,
     )
 
-    // 展开态互斥：父层收起了我 / 别人展开了 / 进入多选 → 复位
-    LaunchedEffect(isRevealed, selectionMode) {
+    // isRevealed 会被 LaunchedEffect(interactionSource) 捕获。
+    // 该 effect 的 key 只有 interactionSource，闭包里必须读最新值，
+    // 否则永远是首次组合时的 isRevealed，起手占位判断就会错。
+    val currentIsRevealed = rememberUpdatedState(isRevealed)
+
+    // 是否正被手指拖动。拖动中不允许被「互斥复位」强制收回：
+    // 此时 animateTo 会和用户手势抢同一个值，表现为抖动/突然跳位。
+    // 处理办法是「拖动中先记账，松手后再收」。
+    var isDragging by remember { mutableStateOf(false) }
+
+    // 拖动交互源：用于在「手指刚开始拖」的瞬间就抢占展开态。
+    // 这是修两个 Bug 的关键 —— 见下方 collect 里的说明。
+    val interactionSource = remember { MutableInteractionSource() }
+
+    // 展开态互斥：父层收起了我 / 别人展开了 / 进入多选 → 复位。
+    //
+    // 关键点：如果这时我正被手指拖着，**不能**立刻 animateTo(Settled)，
+    // 否则会和手势抢控制权。改为等 isDragging 变 false（松手）后再由下面的
+    // 回调自然收敛。
+    LaunchedEffect(isRevealed, selectionMode, isDragging) {
         val shouldOpen = isRevealed && !selectionMode
         val target = if (shouldOpen) RowAnchor.Open else RowAnchor.Settled
+        // 拖动中且目标是收起 → 让手势自己先结束
+        if (!shouldOpen && isDragging) return@LaunchedEffect
         if (state.currentValue != target || state.targetValue != target) {
             state.animateTo(target)
         }
     }
 
-    // 把自己滑开的动作上报给父层（父层据此收起其他行）
+    // 把自己「开始展开」的动作上报给父层（父层据此立刻收起其它行）。
+    //
+    // 这里**不用 settledValue**：它只在动画彻底停稳后才更新，导致「拉 B 行」要等
+    // B 完全打开才通知父层去关 A —— 就是「新抽屉完全打开后，旧抽屉才开始关」。
+    //
+    // 改用 DragInteraction.Start：手指一按下、拖动真正开始的那一刻就会发出，
+    // 早于任何阈值判断。于是：
+    //   1) 旧的抽屉立刻开始收起，而不是等新的停稳；
+    //   2) 多指同时拖时，每一行在起手瞬间都试图抢占 revealedId，
+    //      父层的 revealedId 是单值，后来者覆盖先前者，先前者随即被 animateTo(Settled)
+    //      收回 —— 物理上不可能同时停两个抽屉在 Open。
+    LaunchedEffect(interactionSource) {
+        interactionSource.interactions.collect { interaction ->
+            when (interaction) {
+                is DragInteraction.Start -> {
+                    isDragging = true
+                    // 上报给父层：占用「拖动中」名额，其余行随即被禁用拖拽
+                    currentOnDragStateChange.value(true)
+                    // 起手即占位：先让父层知道「现在是我在展开」
+                    if (!currentIsRevealed.value) currentOnRevealChange.value(true)
+                }
+                is DragInteraction.Stop, is DragInteraction.Cancel -> {
+                    isDragging = false
+                    currentOnDragStateChange.value(false)
+                }
+                else -> Unit
+            }
+        }
+    }
+
+    // 拖动结束后，按真实落点纠正一次：
+    // 没过阈值就回弹的情况，起手时虽然占了位，但要立刻把位子还回去。
     LaunchedEffect(state) {
         snapshotFlow { state.settledValue }.collect { settled ->
             val open = settled == RowAnchor.Open
@@ -169,7 +231,8 @@ fun HomeworkItemRow(
                 .anchoredDraggable(
                     state = state,
                     orientation = Orientation.Horizontal,
-                    enabled = !selectionMode,
+                    enabled = !selectionMode && dragEnabled,
+                    interactionSource = interactionSource,
                     flingBehavior = flingBehavior,
                 )
         ) {

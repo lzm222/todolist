@@ -299,6 +299,22 @@ val isEmpty get() = if (isToday) groups.isEmpty() && overdue.isEmpty()
   - **不要**在组合期算出 `progress: Float` 再作为参数往下传——那等于把高频依赖扩散给子组件。
   - 判据：**这个值每帧都会变吗？** 是 → 走绘制/布局阶段；否 → 可以进组合。
   - `state.settledValue` 属低频（仅动画结束变化），在组合期读是可接受的。
+- **互斥必须在输入层阻断，不能只靠状态收敛**：`settledValue` 只在动画停稳后更新，
+  靠它做互斥会出现「新抽屉完全打开后，旧抽屉才开始关」。正确做法有两条，缺一不可：
+  1. **起手上报**：给 `anchoredDraggable` 传 `interactionSource`，监听
+     `DragInteraction.Start` —— 手指一按下、拖动真正开始时就发，早于任何阈值判断，
+     用它在**起手瞬间**把 `onRevealChange(true)` 报给父层，旧的抽屉立刻开始收。
+  2. **物理禁止**：某行起手时上报 `draggingId`，父层把其余所有行的
+     `anchoredDraggable(enabled = false)`。第二根手指在别的行上根本拖不动。
+     只做第 1 条不够 —— 只要两指都按住不放，两个抽屉就会同时停在 `Open`。
+- **拖动中不能被强制收回**：`isDragging` 为 true 时，即便 `isRevealed` 变 false 也
+  **不要**调 `animateTo(Settled)`：手势正在掌控这个值，抢控制权会抖动/跳位。
+  让手势先结束（`DragInteraction.Stop` / `Cancel`），之后再收敛。
+- **`draggingId` 必须有悬空兜底**：行在拖动中被删除时 `Stop` 不会回传，
+  `draggingId` 悬空会让**所有行永久不可拖**。在持有 `draggingId` 的父层里监听可见集合，
+  发现该 id 已不在列表中立即释放。
+- **`LaunchedEffect(interactionSource)` 里读 `isRevealed` 要用 `rememberUpdatedState`**：
+  该 effect 的 key 只有 `interactionSource`，直接读闭包变量永远是首次组合时的值。
 - **展开/收起由 `isRevealed` 单向驱动**：`LaunchedEffect(isRevealed, selectionMode)` 里
   `shouldOpen = isRevealed && !selectionMode` → `animateTo(Open / Settled)`。
   行**允许长期停在 `Open`**，这是「等用户再点按钮」的载体。
@@ -376,11 +392,12 @@ Row(
 7. 大改动前建议先备份到 `.fixbak/todolist-<HHMMSS>/`（现有基线：`.fixbak/todolist-172157/`）。
 8. `git add -A && git commit`，**一个 Bug 一次提交**，见 §8.1。
 
-交付目录现状（均为 20,387,672 字节）：`v1.0` / `v1.1` / `v1.2` / `v1.3` / `v1.4` / `v1.5` / `v1.6` / `v1.6.1` / `v1.6.2` / `v1.6.3`。
+交付目录现状（均为 20,387,672 字节）：`v1.0` / `v1.1` / `v1.2` / `v1.3` / `v1.4` / `v1.5` / `v1.6` / `v1.6.1` / `v1.6.2` / `v1.6.3` / `v1.7`。
 - v1.6 的 MD5 为 `6a2a556671625e4240c8a2357292a3cd`（滑动删除改为 `anchoredDraggable` 实现）。
 - v1.6.1 的 MD5 为 `0c782dadd44e89cf61b867fdfe6e072b`（修复首帧 `Cannot round NaN value` 崩溃）。
 - v1.6.2 的 MD5 为 `43d6f794890015490e6026ea264d4103`（修复 `progress` 符号导致删除按钮隐形）。
 - v1.6.3 的 MD5 为 `dcb982c65d1897ad46ea398f8969db01`（修复组合期读 `offset` 导致的滑动卡顿）。
+- v1.7 的 MD5 为 `fde6ffd1f9093646a1113dec41d9a59b`（起手即互斥 + 多指物理禁用）。
 
 ### 8.1 版本控制约定
 
@@ -443,6 +460,10 @@ git status --short    # 期望空输出
 | `offset` 两分支类型不一致 | `if (raw.isNaN()) 0f else raw.roundToInt()...` 会被推成 `Number & Comparable<...>`，报 `Argument type mismatch`。必须 `val dx: Int = ...` 且两分支同为 `Int`。见 §6.5。 |
 | `progress` 忘了取负 | `state.offset` 向左为负，`offset / buttonWidthPx` 落在 `[-1, 0]`；背景 `alpha = progress.coerceIn(0f, 1f)` 会把它整段压成 `0`，**删除按钮完全隐形**（行滑开了但只见空白）。必须 `(-offsetPx / buttonWidthPx).coerceIn(0f, 1f)`。v1.6.2 就踩了这条。见 §6.5。 |
 | 在组合作用域里读 `state.offset` | 它每帧都变，读它会让整行每帧重组，表现为「一顿一顿」。位移走 `Modifier.offset { }`、透明度走 `Modifier.graphicsLayer { }`。也不要算出 `progress: Float` 往子组件传。v1.6.3 就踩了这条。见 §6.5。 |
+| 用 `settledValue` 做抽屉互斥 | 它只在动画停稳后更新，结果就是「新抽屉完全打开后，旧抽屉才开始关」。互斥要在 `DragInteraction.Start`（起手）时就发信号。见 §6.5。 |
+| 只靠收 `revealedId` 实现互斥 | 状态收敛永远有延迟，两指都按住不放时两个抽屉会同时停在 `Open`。必须在输入层阻断：上报 `draggingId`，其余行 `enabled = false`。见 §6.5。 |
+| 拖动中强行 `animateTo(Settled)` 收回 | 手势正在掌控该值，抢控制权会抖动/跳位。等 `Stop`/`Cancel` 之后再收敛。见 §6.5。 |
+| `draggingId` 没有悬空兜底 | 行在拖动中被删除时 `Stop` 不回传，`draggingId` 悬空 → **所有行永久不可拖**。父层要监听可见集合，发现 id 消失立即释放。见 §6.5。 |
 | 用 `currentValue`/`targetValue` 回写 `onRevealChange` | 动画途中值会抖动，导致展开态反复翻转。必须用 `settledValue`。见 §6.5。 |
 | 多选状态塞进 ViewModel | 选中集合是纯 UI 私有状态，进 UiState 会给 `combine` 增加无意义同步点，还会让「全选范围」与可见行脱钩。见 §2。 |
 | 全选按全库算而不是按可见行算 | 逾期栏在历史日期不渲染，此时不该被全选选中。`selectableIds` 已按 `isToday` 分支处理，别改成平铺。见 §6.4。 |

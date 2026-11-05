@@ -83,6 +83,11 @@ fun HomeworkScreen(viewModel: HomeworkViewModel) {
     var selectionMode by remember { mutableStateOf(false) }
     var selectedIds by remember { mutableStateOf<Set<Long>>(emptySet()) }
     var revealedId by remember { mutableStateOf<Long?>(null) }
+    // 当前正被手指拖动的行 id。多指同时拖时，只允许第一根手指生效：
+    // 其余行在 draggingId 存在期间被禁用拖拽（enabled=false），
+    // 这是唯一能在物理层面杜绝「同时拉开两个抽屉」的手段 ——
+    // 仅靠事后收回 revealedId 总有延迟，两根手指按住不放时两个都会展开。
+    var draggingId by remember { mutableStateOf<Long?>(null) }
     // 批量删除前的二次确认：多选误触的代价是整批丢失，值得多一步
     var showBatchConfirm by remember { mutableStateOf(false) }
     // 待撤销项改成列表：单条删除是 1 个元素，批量删除是 N 个，撤销走同一条路径
@@ -217,8 +222,12 @@ fun HomeworkScreen(viewModel: HomeworkViewModel) {
                     onLoadSample = { viewModel.loadSampleData() },
                     onImport = { showImport = true },
                     revealedId = revealedId,
+                    draggingId = draggingId,
                     onRevealChange = { id, open ->
                         revealedId = if (open) id else if (revealedId == id) null else revealedId
+                    },
+                    onDragStateChange = { id, dragging ->
+                        draggingId = if (dragging) id else if (draggingId == id) null else draggingId
                     },
                     selectionMode = selectionMode,
                     selectedIds = selectedIds,
@@ -246,7 +255,9 @@ private fun Content(
     onLoadSample: () -> Unit,
     onImport: () -> Unit,
     revealedId: Long?,
+    draggingId: Long?,
     onRevealChange: (Long, Boolean) -> Unit,
+    onDragStateChange: (Long, Boolean) -> Unit,
     selectionMode: Boolean,
     selectedIds: Set<Long>,
     onToggleSelect: (HomeworkItem) -> Unit,
@@ -259,6 +270,17 @@ private fun Content(
     LaunchedEffect(listState.isScrollInProgress) {
         if (listState.isScrollInProgress && revealedId != null) {
             onRevealChange(revealedId, false)
+        }
+    }
+
+    // 兜底：拖动的行可能在中途被删除/移出列表，导致 DragInteraction.Stop
+    // 永远不会回传，draggingId 就悬空了 —— 那会让所有行永久不可拖。
+    // 这里在可见集合变化时检查一次，发现 draggingId 已不在列表中就直接释放。
+    val visibleIds = state.groups.flatMap { it.items }.map { it.id }.toSet() +
+        state.overdue.map { it.item.id }.toSet()
+    LaunchedEffect(visibleIds, draggingId) {
+        if (draggingId != null && draggingId !in visibleIds) {
+            onDragStateChange(draggingId, false)
         }
     }
 
@@ -317,7 +339,9 @@ private fun Content(
                     onToggleDone = onToggleDone,
                     onDelete = onDelete,
                     revealedId = revealedId,
+                    draggingId = draggingId,
                     onRevealChange = onRevealChange,
+                    onDragStateChange = onDragStateChange,
                     selectionMode = selectionMode,
                     selectedIds = selectedIds,
                     onToggleSelect = onToggleSelect,
@@ -355,7 +379,9 @@ private fun Content(
                     onToggleDone = onToggleDone,
                     onDelete = onDelete,
                     revealedId = revealedId,
+                    draggingId = draggingId,
                     onRevealChange = onRevealChange,
+                    onDragStateChange = onDragStateChange,
                     selectionMode = selectionMode,
                     selectedIds = selectedIds,
                     onToggleSelect = onToggleSelect,
