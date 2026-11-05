@@ -36,6 +36,7 @@ import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.unit.IntOffset
@@ -129,15 +130,15 @@ fun HomeworkItemRow(
         }
     }
 
-    // 锚点已在构造期建立，理论上不会再有 NaN；但布局阶段仍可能读到未就绪的
-    // State 快照，所以 progress 与 offset 两处都保留独立防护。
-    // 这不是冗余：progress 在组合期算，offset 在布局期算，是两条不同的求值路径。
+    // 关键：**不要**在这里读 state.offset。
     //
-    // 注意负号：offset 向左为负，区间是 [-buttonWidthPx, 0]。progress 是「展开程度」，
-    // 必须归一化到 [0, 1]，所以要取负。漏掉这个负号会让 progress 恒为负数，
-    // 后续 coerceIn(0f, 1f) 把它压成 0，删除按钮就永远不会显形。
-    val offsetPx = state.offset
-    val progress = if (offsetPx.isNaN()) 0f else (-offsetPx / buttonWidthPx).coerceIn(0f, 1f)
+    // state.offset 是可观察值，在组合作用域里读它，会让整个 HomeworkItemRow
+    // 在拖动期间每一帧都重组一次（ItemContent、Surface、图标、文字全部跟着重走），
+    // 表现为滑动「一顿一顿」。正确做法是把读取下沉到真正需要它的最小作用域：
+    // 用 graphicsLayer / offset 的 lambda 版 modifier —— 它们只在绘制/布局阶段求值，
+    // 不触发重组，也不触发父层重新测量。
+    //
+    // 因此这里只把 state 与 buttonWidthPx 传下去，由 DeleteBackground 内部读。
 
     Box(
         modifier = modifier
@@ -145,9 +146,12 @@ fun HomeworkItemRow(
             .heightIn(min = 56.dp),
         contentAlignment = Alignment.CenterEnd,
     ) {
-        // 背景按钮：随拖动进度淡入，只占按钮宽度那一条
+        // 背景按钮：随拖动进度淡入，只占按钮宽度那一条。
+        // 传 state 而不是 progress：让 offset 的读取发生在 graphicsLayer 的
+        // 绘制阶段 lambda 里，避免拖动期间触发重组。
         DeleteBackground(
-            progress = progress,
+            state = state,
+            buttonWidthPx = buttonWidthPx,
             enabled = state.settledValue == RowAnchor.Open,
             onDelete = { currentOnDelete.value() },
         )
@@ -181,19 +185,36 @@ fun HomeworkItemRow(
     }
 }
 
-/** 右对齐的删除按钮：整块可点、有涟漪；[progress] 驱动淡入 */
+/**
+ * 右对齐的删除按钮：整块可点、有涟漪；展开程度驱动淡入。
+ *
+ * 这里**刻意不收 `progress: Float`**，而是收 `state`：
+ * `progress` 若在父层组合期算出来传下来，父层就会依赖 `state.offset`，
+ * 拖动期间每一帧都重组整行，滑动就会「一顿一顿」。
+ * 改成在 `graphicsLayer { }` 的绘制阶段 lambda 里读 offset，
+ * 于是每帧只重绘这一层，不重组、不重新测量。
+ */
 @Composable
 private fun DeleteBackground(
-    progress: Float,
+    state: AnchoredDraggableState<RowAnchor>,
+    buttonWidthPx: Float,
     enabled: Boolean,
     onDelete: () -> Unit,
 ) {
-    val alpha = progress.coerceIn(0f, 1f)
+    // 展开程度：offset 向左为负（区间 [-buttonWidthPx, 0]），取负归一化到 [0, 1]。
+    // 漏掉负号会让值恒为负数，被 coerceIn 压成 0，按钮就永远不显形（v1.6.2 的坑）。
+    val progressOf: () -> Float = {
+        val raw = state.offset
+        if (raw.isNaN() || buttonWidthPx <= 0f) 0f
+        else (-raw / buttonWidthPx).coerceIn(0f, 1f)
+    }
+
     Box(
         modifier = Modifier
             .width(DeleteButtonWidth)
             .fillMaxHeight()
-            .background(MaterialTheme.colorScheme.errorContainer.copy(alpha = alpha)),
+            .graphicsLayer { alpha = progressOf() }
+            .background(MaterialTheme.colorScheme.errorContainer),
         contentAlignment = Alignment.CenterEnd,
     ) {
         Row(
@@ -202,7 +223,7 @@ private fun DeleteBackground(
                 .fillMaxHeight()
                 .padding(vertical = 2.dp)
                 .clip(MaterialTheme.shapes.small)
-                .background(MaterialTheme.colorScheme.error.copy(alpha = alpha))
+                .background(MaterialTheme.colorScheme.error)
                 .clickable(enabled = enabled, onClick = onDelete)
                 .padding(horizontal = 4.dp, vertical = 8.dp),
             verticalAlignment = Alignment.CenterVertically,
@@ -211,13 +232,13 @@ private fun DeleteBackground(
             Icon(
                 imageVector = Icons.Rounded.Delete,
                 contentDescription = null,
-                tint = MaterialTheme.colorScheme.onError.copy(alpha = alpha),
+                tint = MaterialTheme.colorScheme.onError,
                 modifier = Modifier.size(20.dp),
             )
             Text(
                 text = "删除",
                 style = MaterialTheme.typography.labelLarge,
-                color = MaterialTheme.colorScheme.onError.copy(alpha = alpha),
+                color = MaterialTheme.colorScheme.onError,
                 modifier = Modifier.padding(start = 4.dp),
             )
         }

@@ -291,6 +291,14 @@ val isEmpty get() = if (isToday) groups.isEmpty() && overdue.isEmpty()
   **按钮完全隐形**（v1.6.2 就是这个现象：行滑开了，露出一条空白）。
   正确写法：`(-offsetPx / buttonWidthPx).coerceIn(0f, 1f)`。
   不要指望下游 `coerceIn` 替你纠正符号——它只夹范围，不取绝对值。
+- **`state.offset` 绝不能在组合作用域里读**：它是可观察状态，读它会让整个 `HomeworkItemRow`
+  依赖它。拖动时 offset 每帧都变 → **整行每帧重组**（`ItemContent`/`Surface`/图标/文字全部重走），
+  手感就是「一顿一顿」（v1.6.3 的症状）。
+  - 位移：`Modifier.offset { }` 的 lambda（布局阶段求值）。
+  - 透明度：`Modifier.graphicsLayer { alpha = ... }`（绘制阶段求值）。
+  - **不要**在组合期算出 `progress: Float` 再作为参数往下传——那等于把高频依赖扩散给子组件。
+  - 判据：**这个值每帧都会变吗？** 是 → 走绘制/布局阶段；否 → 可以进组合。
+  - `state.settledValue` 属低频（仅动画结束变化），在组合期读是可接受的。
 - **展开/收起由 `isRevealed` 单向驱动**：`LaunchedEffect(isRevealed, selectionMode)` 里
   `shouldOpen = isRevealed && !selectionMode` → `animateTo(Open / Settled)`。
   行**允许长期停在 `Open`**，这是「等用户再点按钮」的载体。
@@ -368,10 +376,11 @@ Row(
 7. 大改动前建议先备份到 `.fixbak/todolist-<HHMMSS>/`（现有基线：`.fixbak/todolist-172157/`）。
 8. `git add -A && git commit`，**一个 Bug 一次提交**，见 §8.1。
 
-交付目录现状（均为 20,387,672 字节）：`v1.0` / `v1.1` / `v1.2` / `v1.3` / `v1.4` / `v1.5` / `v1.6` / `v1.6.1` / `v1.6.2`。
+交付目录现状（均为 20,387,672 字节）：`v1.0` / `v1.1` / `v1.2` / `v1.3` / `v1.4` / `v1.5` / `v1.6` / `v1.6.1` / `v1.6.2` / `v1.6.3`。
 - v1.6 的 MD5 为 `6a2a556671625e4240c8a2357292a3cd`（滑动删除改为 `anchoredDraggable` 实现）。
 - v1.6.1 的 MD5 为 `0c782dadd44e89cf61b867fdfe6e072b`（修复首帧 `Cannot round NaN value` 崩溃）。
 - v1.6.2 的 MD5 为 `43d6f794890015490e6026ea264d4103`（修复 `progress` 符号导致删除按钮隐形）。
+- v1.6.3 的 MD5 为 `dcb982c65d1897ad46ea398f8969db01`（修复组合期读 `offset` 导致的滑动卡顿）。
 
 ### 8.1 版本控制约定
 
@@ -433,6 +442,7 @@ git status --short    # 期望空输出
 | 用 `LaunchedEffect` 建立锚点 | 首帧布局早于 `LaunchedEffect`，那之前 `state.offset` 是 `NaN`。锚点必须用 `remember(buttonWidthPx) { AnchoredDraggableState(initialValue, anchors = ...) }` 在组合期建好。见 §6.5。 |
 | `offset` 两分支类型不一致 | `if (raw.isNaN()) 0f else raw.roundToInt()...` 会被推成 `Number & Comparable<...>`，报 `Argument type mismatch`。必须 `val dx: Int = ...` 且两分支同为 `Int`。见 §6.5。 |
 | `progress` 忘了取负 | `state.offset` 向左为负，`offset / buttonWidthPx` 落在 `[-1, 0]`；背景 `alpha = progress.coerceIn(0f, 1f)` 会把它整段压成 `0`，**删除按钮完全隐形**（行滑开了但只见空白）。必须 `(-offsetPx / buttonWidthPx).coerceIn(0f, 1f)`。v1.6.2 就踩了这条。见 §6.5。 |
+| 在组合作用域里读 `state.offset` | 它每帧都变，读它会让整行每帧重组，表现为「一顿一顿」。位移走 `Modifier.offset { }`、透明度走 `Modifier.graphicsLayer { }`。也不要算出 `progress: Float` 往子组件传。v1.6.3 就踩了这条。见 §6.5。 |
 | 用 `currentValue`/`targetValue` 回写 `onRevealChange` | 动画途中值会抖动，导致展开态反复翻转。必须用 `settledValue`。见 §6.5。 |
 | 多选状态塞进 ViewModel | 选中集合是纯 UI 私有状态，进 UiState 会给 `combine` 增加无意义同步点，还会让「全选范围」与可见行脱钩。见 §2。 |
 | 全选按全库算而不是按可见行算 | 逾期栏在历史日期不渲染，此时不该被全选选中。`selectableIds` 已按 `isToday` 分支处理，别改成平铺。见 §6.4。 |

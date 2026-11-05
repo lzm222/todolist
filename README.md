@@ -180,6 +180,22 @@ chmod +x ./setup_android_env.sh
 
 > 这是 v1.6 的收尾修复，未改任何交互语义：滑开仍只露 88dp 按钮、仍不写数据库、向右仍无响应、展开互斥与撤销通道全部照旧。对外签名与文件结构零改动，只动 `HomeworkItemRow.kt` 一个文件。
 
+### v1.6.3 修复说明
+
+| 问题 | 原因 | 修复 |
+| --- | --- | --- |
+| 左滑时手感「一顿一顿」，掉帧明显 | `val offsetPx = state.offset` 是在 `HomeworkItemRow` 的**组合作用域**里读的。`state.offset` 是可观察状态，读它会让整个 `HomeworkItemRow` 依赖它——拖动时 offset 每帧都变，于是**整行每帧重组一次**，`ItemContent`、`Surface`、图标、文字、Checkbox 全部跟着重走。父层算出的 `progress: Float` 再往下传，等于把这个高频依赖又扩散了一层 | 把 `offset` 的读取**下沉到绘制阶段**：`DeleteBackground` 不再收 `progress: Float`，改收 `state`，内部用 `.graphicsLayer { alpha = ... }` 的 lambda 读 offset。`graphicsLayer` 的 lambda 在绘制阶段求值，**不进入组合、不触发重组、不重新测量**，拖动时每帧只重绘这一层 |
+
+> 这类「值密集变化」的动画量（offset、alpha、scale、rotation）都不该进组合作用域，而应交给 `graphicsLayer` / `drawBehind` / `offset { }` 这类 lambda 版 modifier。判据很简单：**这个值每帧都会变吗？** 是 → 走绘制/布局阶段；否 → 可以进组合。
+
+### v1.6.3 回归验证
+
+- [x] 左滑/右滑回弹，全程跟手，无明显掉帧
+- [x] 快速反复左右拖拽 → 不卡顿、不错位
+- [x] 删除按钮仍随位移淡入，完全展开时完全不透明
+- [x] 上下滚动列表仍然流畅，滚动时无展开残留
+- [x] 完全展开后点按钮 → 正常删除并弹「撤销」
+
 ### v1.6.2 修复说明
 
 | 问题 | 原因 | 修复 |
