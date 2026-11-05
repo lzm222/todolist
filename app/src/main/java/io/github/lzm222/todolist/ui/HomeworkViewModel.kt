@@ -46,6 +46,29 @@ data class HomeworkUiState(
             // 否则"删光某一天的任务"会被其它日期的逾期项掩盖，掉进空白页
             groups.isEmpty()
         }
+
+    /**
+     * 当前屏幕上「可被多选」的所有条目 id，即当日清单 + 今天视角下的逾期栏。
+     *
+     * 抽成派生属性而不是新增字段，理由有二：
+     * 1. 全选必须和用户实际能看到的行一致，逾期栏在历史日期不渲染，就不该进全选集合；
+     * 2. 它是纯派生数据，加进数据流 combine 只会多一处需要同步的地方。
+     */
+    val selectableIds: List<Long>
+        get() = buildList {
+            groups.forEach { group -> group.items.forEach { add(it.id) } }
+            if (isToday) overdue.forEach { add(it.item.id) }
+        }
+
+    /**
+     * 屏幕上所有条目对象（当日清单 + 今天视角下的逾期栏），供按 id 反查实体用。
+     * 批量删除需要拿到 [HomeworkItem] 本身而不是 id，撤销时还要靠这些对象回填文案。
+     */
+    val allItems: List<HomeworkItem>
+        get() = buildList {
+            groups.forEach { group -> addAll(group.items) }
+            if (isToday) overdue.forEach { add(it.item) }
+        }
 }
 
 @OptIn(ExperimentalCoroutinesApi::class)
@@ -144,10 +167,31 @@ class HomeworkViewModel(private val repo: HomeworkRepository) : ViewModel() {
         }
     }
 
+    /**
+     * 批量删除。
+     * 文案里只给条数，不拼接内容（多选可能横跨多个科目）。
+     */
+    fun deleteBatch(items: List<HomeworkItem>) {
+        if (items.isEmpty()) return
+        viewModelScope.launch {
+            repo.deleteBatch(items.map { it.id })
+            _message.value = "已删除 ${items.size} 项"
+        }
+    }
+
     fun undoDelete(item: HomeworkItem) {
         viewModelScope.launch {
             repo.restore(item.id)
             _message.value = "已恢复"
+        }
+    }
+
+    /** 撤销批量删除：一次性恢复全部 id，文案按条数生成。 */
+    fun undoDeleteBatch(items: List<HomeworkItem>) {
+        if (items.isEmpty()) return
+        viewModelScope.launch {
+            repo.restoreBatch(items.map { it.id })
+            _message.value = "已恢复 ${items.size} 项"
         }
     }
 

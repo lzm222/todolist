@@ -32,6 +32,18 @@ class HomeworkRepository(private val dao: HomeworkDao) {
 
     suspend fun restore(id: Long) = dao.setDeleted(id, false)
 
+    /** 批量软删除。单条删除也走这里，保证只有一份实现。 */
+    suspend fun deleteBatch(ids: List<Long>) {
+        if (ids.isEmpty()) return
+        dao.setDeletedBatch(ids, true)
+    }
+
+    /** 批量恢复（撤销删除）。 */
+    suspend fun restoreBatch(ids: List<Long>) {
+        if (ids.isEmpty()) return
+        dao.setDeletedBatch(ids, false)
+    }
+
     /** 清理被软删除的行，释放唯一索引占位。 */
     suspend fun purgeDeleted() = dao.purgeDeleted()
 }

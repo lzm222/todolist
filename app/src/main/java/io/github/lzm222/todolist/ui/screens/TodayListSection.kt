@@ -15,13 +15,25 @@ import androidx.compose.ui.unit.dp
 import io.github.lzm222.todolist.data.HomeworkItem
 import io.github.lzm222.todolist.ui.SubjectGroup
 
-/** 当日清单：按科目分组展示。 */
+/**
+ * 当日清单：按科目分组展示。
+ *
+ * 多选与「单行展开」都是 UI 层私有状态，由 [HomeworkScreen] 持有并通过下面的参数下发：
+ * - [revealedId]：当前展开删除按钮的行 id（互斥，同一时刻只有一行展开）
+ * - [selectionMode] / [selectedIds]：多选态
+ */
 @Composable
 fun TodayListSection(
     groups: List<SubjectGroup>,
     onToggleDone: (HomeworkItem) -> Unit,
     onDelete: (HomeworkItem) -> Unit,
-    modifier: Modifier = Modifier
+    modifier: Modifier = Modifier,
+    revealedId: Long? = null,
+    onRevealChange: (Long, Boolean) -> Unit = { _, _ -> },
+    selectionMode: Boolean = false,
+    selectedIds: Set<Long> = emptySet(),
+    onToggleSelect: (HomeworkItem) -> Unit = {},
+    onLongPress: (HomeworkItem) -> Unit = {},
 ) {
     Column(modifier = modifier.fillMaxWidth()) {
         groups.forEach { group ->
@@ -36,7 +48,13 @@ fun TodayListSection(
                     HomeworkItemRow(
                         item = item,
                         onToggleDone = { onToggleDone(item) },
-                        onDelete = { onDelete(item) }
+                        onDelete = { onDelete(item) },
+                        isRevealed = revealedId == item.id,
+                        onRevealChange = { open -> onRevealChange(item.id, open) },
+                        selectionMode = selectionMode,
+                        isSelected = item.id in selectedIds,
+                        onToggleSelect = { onToggleSelect(item) },
+                        onLongPress = { onLongPress(item) },
                     )
                 }
             }

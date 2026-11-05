@@ -57,6 +57,11 @@ app/src/main/java/io/github/lzm222/todolist/
 - **ViewModel 负责状态聚合与文案**。用户看到的每一个中文字符串都在这里拼好，UI 层不要自己造句子。
 - **Composable 只渲染**。UI 层**不出现硬编码色值**，一律 `MaterialTheme.colorScheme.*`。
 - 新增数据流请走 `Flow`（`observeByDate` → `flatMapLatest` → `combine` → `stateIn`），不要引入一次性 `suspend` 查询再手工刷新。
+- **多选/展开等交互状态属于 UI 层私有状态，不进 ViewModel**。`selectionMode`、`selectedIds`、`revealedId`、
+  `showBatchConfirm`、`lastDeleted` 全部用 `HomeworkScreen` 里的 `remember { mutableStateOf(...) }` 持有。
+  它们一旦进 `UiState`，就会给 `combine` 增加与数据无关的同步点，并把「全选范围」与「当前可见行」解耦。
+- `UiState` 里允许出现**派生属性**（如 `selectableIds`、`allItems`）：用 getter 从既有字段算出，
+  不新增字段、不新增 `combine` 输入。它们的存在理由是「全选必须与可见行一致」，而不是缓存。
 
 ---
 
@@ -210,21 +215,39 @@ val isEmpty get() = if (isToday) groups.isEmpty() && overdue.isEmpty()
 
 `availableDates` 在 `combine` 中拼为 `(dates + todayStr).distinct().sortedDescending()`——**今天始终可选**。
 
-### 6.4 完成 ≠ 删除
+### 6.4 完成 ≠ 滑开 ≠ 删除（三件事必须分开）
 
-- 勾选：`isDone` 置位，条目**留在原地**，划线 + 灰化。
-- 滑动：`SwipeToDismissBox`，触发后 `deleted` 置位，Snackbar 提供「撤销」。
-- 撤销判定靠 `msg.startsWith("已删除")`；非删除类消息必须清空 `lastDeleted`，防止误撤销上一条。
+- **勾选**：`isDone` 置位，条目**留在原地**，划线 + 灰化。
+- **滑开**：`SwipeToDismissBox` 只把行推到 `EndToStart` 展开态、露出背景按钮，**不写数据库**。
+- **删除**：只有用户**点击**背景那个删除按钮才调 `onDelete`，`deleted` 置位，Snackbar 提供「撤销」。
+- **右滑不响应**：`enableDismissFromStartToEnd = false`。背景只实现了一侧按钮，两个方向都能滑纯属误触入口。
+- **批量删除**：长按进入多选 → 标题栏换成 `SelectionTopBar` → 删除图标弹 `BatchDeleteConfirmDialog` 二次确认 → `viewModel.deleteBatch(targets)`。
+- 撤销判定靠 `msg.startsWith("已删除")`；`lastDeleted` 的类型是 `List<HomeworkItem>`，**非删除类消息必须清空它**，防止误撤销上一条。
+- 单条删除与批量删除共用 `undoDeleteBatch`（长度 1 的批量）。不要为单条另开一条撤销通道。
 
-### 6.5 滑动删除的动画复位
+### 6.5 滑开只是展开，绝不要写成「滑开即删」
 
 `HomeworkItemRow` 的 `rememberSwipeToDismissBoxState`：
 
-- `confirmValueChange` **只返回 Boolean**，不要在里面调数据层。
-- 真正删除放在 `LaunchedEffect(dismissState.currentValue)` 里，删完立刻 `dismissState.reset()`。
+- `positionalThreshold` **必须显式传入**，值为 `屏幕宽度 × 0.3`。默认值是固定 56dp（`SwipeToDismissBoxDefaults`
+  字节码里 `bipush 56`），在垂直滚动中一次轻微横向漂移就能越过，这正是 v1.5 要修的误触根源。
+  计算方式：`LocalDensity` 取 `screenWidthDp.dp.toPx()`，注意 `positionalThreshold` 的单位是**像素**。
+- `confirmValueChange` **已弃用**（字节码原文含 `confirmValueChange is deprecated without replacement`），
+  **不要再用它**，也不要指望它做「拦截」。
+- `SwipeToDismissBox(onDismiss = { })` **必须留空**。谁把删除写进 `onDismiss`，滑开就会立刻删除，
+  v1.5 的修复全部作废，退回误触。
+- 行**允许长期停在 `EndToStart`**——这正是「等用户再点按钮」的载体。不要再写「删完立刻 `reset()`」，
+  也不要把「未删除却处于展开态」当成异常去强制复位。
+- 背景删除按钮 `enabled = dismissState.currentValue == EndToStart`，只有真正展开后按钮才可点，
+  避免行在动画途中的瞬时回调误触。
+- 展开是**互斥**的：`HomeworkScreen` 用 `revealedId: Long?` 保存唯一展开行的 id，
+  `onRevealChange = { id, open -> revealedId = if (open) id else if (revealedId == id) null else revealedId }`。
+  收起分支**必须**比对 id，否则旧行的延迟回调会把新行的展开态清掉。
+- 滚动即收起：`Content` 里 `LaunchedEffect(listState.isScrollInProgress)`，滚动开始且 `revealedId != null` 时收起。
+- 切换日期、进入多选、长按、点击删除，这些入口都必须把 `revealedId` 置空，防止跨状态残留。
 
-原因：让行消失的应该是**数据变化**，不是组件内部状态。否则数据没刷新或被撤销时，
-组件会卡在「已滑开但仍占位」的半死状态，再也滑不回来。
+原因：让行消失的应该是**数据变化**，不是组件内部状态。但「展开」本身是合法的稳定状态，
+所以它可以长期存在、也可以被撤销——这是与旧实现（滑开即删）的根本区别。
 
 ### 6.6 可点击组件：命中区域 = 视觉区域
 
@@ -336,7 +359,11 @@ git status --short    # 期望空输出
 | `@Entity` 索引 ≠ 部分唯一索引 | 唯一性只在 `MIGRATION_1_2` 的 SQL 里，Room 无法从实体注解推导。升版本必须手写迁移。 |
 | `AssitTool` 拼写 | 少一个 `s`。IDE 重命名会把它改掉，注意别在 diff 里产生大面积无意义改动。 |
 | 空态整屏替换 | 曾经踩过：日期条被吞，用户无法切到历史日期。见 §6.1。 |
-| 在 `confirmValueChange` 里删数据 | 会让行卡在 dismissed。见 §6.5。 |
+| 把删除写进 `onDismiss` | 滑开即删，退回 v1.5 修掉的误触。`onDismiss` 必须留空。见 §6.5。 |
+| 用 `confirmValueChange` 做拦截或删数据 | 该参数已弃用（无替代），且容易让行卡在 dismissed。见 §6.5。 |
+| 不传 `positionalThreshold` | 默认固定 56dp，垂直滚动时的横向漂移就能越过，误触会立刻回来。见 §6.5。 |
+| 多选状态塞进 ViewModel | 选中集合是纯 UI 私有状态，进 UiState 会给 `combine` 增加无意义同步点，还会让「全选范围」与可见行脱钩。见 §2。 |
+| 全选按全库算而不是按可见行算 | 逾期栏在历史日期不渲染，此时不该被全选选中。`selectableIds` 已按 `isToday` 分支处理，别改成平铺。见 §6.4。 |
 | 往仓库里漏提交 `app/build` 或 `local.properties` | `app/build` 有 97M，`local.properties` 含 `/root/Android` 机器路径。`git add -A` 前先 `git status --short` 扫一眼，或用 `git add -A --dry-run` 预检。见 §8.1。 |
 
 ---

@@ -49,6 +49,13 @@ interface HomeworkDao {
     @Query("UPDATE homework_items SET deleted = :deleted WHERE id = :id")
     suspend fun setDeleted(id: Long, deleted: Boolean)
 
+    /**
+     * 批量软删除 / 批量恢复。
+     * 用一条 UPDATE 完成，避免 N 次往返；空列表直接不产生影响行。
+     */
+    @Query("UPDATE homework_items SET deleted = :deleted WHERE id IN (:ids)")
+    suspend fun setDeletedBatch(ids: List<Long>, deleted: Boolean)
+
     @Query("DELETE FROM homework_items WHERE deleted = 1")
     suspend fun purgeDeleted()
 }

@@ -28,7 +28,13 @@ fun OverdueSection(
     entries: List<OverdueEntry>,
     onToggleDone: (HomeworkItem) -> Unit,
     onDelete: (HomeworkItem) -> Unit,
-    modifier: Modifier = Modifier
+    modifier: Modifier = Modifier,
+    revealedId: Long? = null,
+    onRevealChange: (Long, Boolean) -> Unit = { _, _ -> },
+    selectionMode: Boolean = false,
+    selectedIds: Set<Long> = emptySet(),
+    onToggleSelect: (HomeworkItem) -> Unit = {},
+    onLongPress: (HomeworkItem) -> Unit = {},
 ) {
     if (entries.isEmpty()) return
 
@@ -70,7 +76,13 @@ fun OverdueSection(
                 OverdueRow(
                     entry = entry,
                     onToggleDone = { onToggleDone(entry.item) },
-                    onDelete = { onDelete(entry.item) }
+                    onDelete = { onDelete(entry.item) },
+                    isRevealed = revealedId == entry.item.id,
+                    onRevealChange = { open -> onRevealChange(entry.item.id, open) },
+                    selectionMode = selectionMode,
+                    isSelected = entry.item.id in selectedIds,
+                    onToggleSelect = { onToggleSelect(entry.item) },
+                    onLongPress = { onLongPress(entry.item) },
                 )
             }
             Spacer(Modifier.height(6.dp))
@@ -82,7 +94,13 @@ fun OverdueSection(
 private fun OverdueRow(
     entry: OverdueEntry,
     onToggleDone: () -> Unit,
-    onDelete: () -> Unit
+    onDelete: () -> Unit,
+    isRevealed: Boolean,
+    onRevealChange: (Boolean) -> Unit,
+    selectionMode: Boolean,
+    isSelected: Boolean,
+    onToggleSelect: () -> Unit,
+    onLongPress: () -> Unit,
 ) {
     Column(modifier = Modifier.padding(horizontal = 12.dp)) {
         Row(
@@ -111,7 +129,13 @@ private fun OverdueRow(
         HomeworkItemRow(
             item = entry.item,
             onToggleDone = onToggleDone,
-            onDelete = onDelete
+            onDelete = onDelete,
+            isRevealed = isRevealed,
+            onRevealChange = onRevealChange,
+            selectionMode = selectionMode,
+            isSelected = isSelected,
+            onToggleSelect = onToggleSelect,
+            onLongPress = onLongPress,
         )
     }
 }
