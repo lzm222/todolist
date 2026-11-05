@@ -1,0 +1,307 @@
+# AGENTS.md
+
+给 AI 编码代理看的项目说明书。**动手改代码前先读这一份**，它记录了这个项目里
+「看起来可以随便改、一改就出 Bug」的地方。
+
+面向人类的介绍、功能说明与版本修复日志在 [`README.md`](./README.md)；
+JSON 导入格式的权威定义在 [`SKILL.md`](./app/src/main/assets/skills/homework-import/SKILL.md)。
+三者的分工不要混：本文件讲**约束**，README 讲**故事**，SKILL 讲**格式**。
+
+---
+
+## 1. 项目速览
+
+| 项 | 值 |
+| --- | --- |
+| 名称 | 作业清单（`rootProject.name`） |
+| 包名 / namespace | `io.github.lzm222.todolist` |
+| 技术栈 | Jetpack Compose + Material 3 + Room + Kotlin Coroutines |
+| minSdk / targetSdk / compileSdk | 24 / 35 / 35 |
+| Kotlin / AGP / KSP | 2.3.10 / 9.0.0 / 2.3.13（见 `gradle/libs.versions.toml`） |
+| Room / Compose BOM | 2.8.5 / 2026.01.01 |
+| JDK | 17，且 `isCoreLibraryDesugaringEnabled = true`（依赖 `java.time`） |
+| 产物 | `app/build/outputs/apk/debug/app-debug.apk` |
+
+**构建环境是 ARM64 + Proot（无 Android Studio）**，这一点决定了两处不能动的配置，见 §3。
+
+---
+
+## 2. 分层架构（改动必须顺着分层走）
+
+```
+app/src/main/java/io/github/lzm222/todolist/
+├── MainActivity.kt          组装：建库、建 ViewModel、装 Skill、申请存储权限
+├── data/
+│   ├── HomeworkItem.kt      @Entity，唯一数据模型
+│   ├── HomeworkDao.kt       纯 SQL，不含任何业务判断
+│   ├── AppDatabase.kt       Room 单例 + MIGRATION_1_2
+│   ├── HomeworkRepository.kt 业务规则（软删除语义、导入去重统计）
+│   └── SampleData.kt        空态示例数据（今天/昨天/前天共 7 条）
+├── parse/HomeworkJsonParser.kt  JSON → List<HomeworkItem>，带行号错误定位
+├── skill/SkillInstaller.kt      把 assets 里的 SKILL.md 释放到 Download
+└── ui/
+    ├── HomeworkViewModel.kt     状态聚合 + 文案生成（唯一允许拼文案的地方）
+    └── screens/
+        ├── HomeworkScreen.kt          LazyColumn 骨架、Snackbar、日期条、空态、Skill 卡
+        ├── TodayListSection.kt        当日分组列表
+        ├── OverdueSection.kt          逾期栏
+        ├── HomeworkItemRow.kt         单行：勾选完成 / 滑动删除
+        └── ImportDialog.kt            导入弹窗（含 AssitTool）
+```
+
+分层红线：
+
+- **DAO 只写 SQL**。不要在 DAO 里加业务判断；不要让查询返回已经聚合好的 DTO。
+- **Repository 负责业务规则**：软删除 = `deleted` 置位；恢复 = 置回；导入去重靠 `insertAll` 的 rowId 判定。
+- **ViewModel 负责状态聚合与文案**。用户看到的每一个中文字符串都在这里拼好，UI 层不要自己造句子。
+- **Composable 只渲染**。UI 层**不出现硬编码色值**，一律 `MaterialTheme.colorScheme.*`。
+- 新增数据流请走 `Flow`（`observeByDate` → `flatMapLatest` → `combine` → `stateIn`），不要引入一次性 `suspend` 查询再手工刷新。
+
+---
+
+## 3. 构建（两处 ARM64 配置绝对不要删）
+
+```bash
+# 首次进入环境
+chmod +x ./setup_android_env.sh && ./setup_android_env.sh
+
+# 日常构建
+./gradlew :app:assembleDebug
+
+# Agent 快速验证（只看错误与结果）
+./gradlew :app:assembleDebug 2>&1 | grep -E "^(e:|w:)|error:|BUILD"
+```
+
+必须保留的两处：
+
+1. `gradle.properties` 末尾
+   ```properties
+   android.aapt2.process.daemon=false
+   ```
+   Proot 里 AAPT2 daemon 起不来，会报 `Daemon startup failed`。
+
+2. `app/build.gradle.kts` 中的强制换 target
+   ```kotlin
+   configurations.all {
+       resolutionStrategy.eachDependency {
+           if (requested.group == "com.android.tools.build" && requested.name == "aapt2") {
+               useTarget("com.android.tools.build:aapt2:${requested.version}:linux-aarch64")
+           }
+       }
+   }
+   ```
+   仓库里另有 `tools/aapt2/aapt2-arm64-v8a` 与 `setup_android_env.sh` 配套。
+
+其他注意：
+
+- 仓库镜像走 `settings.gradle.kts`（阿里云 + 华为云），`repositoriesMode` 是 `FAIL_ON_PROJECT_REPOS`，
+  **不要**在模块级 build 文件里另加 `repositories { }`，否则构建直接失败。
+- 构建成功后请自己确认「零 error、零 warning」，不要只看 `BUILD SUCCESSFUL`。
+
+---
+
+## 4. 数据库契约
+
+`AppDatabase`：`version = 2`、`exportSchema = false`、库名 `homework.db`、单例双重检查锁。
+
+**唯一性由「部分唯一索引」承担，这是本项目最关键的设计点：**
+
+```sql
+-- MIGRATION_1_2 的四个步骤，顺序不能换
+DELETE FROM homework_items WHERE deleted = 1;
+DROP INDEX IF EXISTS `index_homework_items_dueDate_subject_content`;
+CREATE UNIQUE INDEX IF NOT EXISTS `index_homework_items_dueDate_subject_content_active`
+  ON `homework_items` (`dueDate`, `subject`, `content`) WHERE `deleted` = 0;
+CREATE INDEX IF NOT EXISTS `index_homework_items_dueDate_subject_content`
+  ON `homework_items` (`dueDate`, `subject`, `content`);
+```
+
+为什么这样：旧的全表唯一索引会让**软删除行继续占着唯一键**，于是「删光后再导入同样的作业」
+全部被判重复、插入 0 条。改成只约束 `deleted = 0` 的行之后，软删除不再挡插入。
+
+配套注意：
+
+- `HomeworkItem` 的 `indices` 里三项都是**普通** `Index`，没有 `unique = true`。
+  Room 的 `@Entity` 表达不了部分索引，所以唯一性**只存在于迁移脚本里**。
+  → 若将来升到 v3，必须用 `Migration` 显式重建这个部分索引，**不能靠 Room 自动生成**。
+- 有 `fallbackToDestructiveMigration(dropAllTables = true)` 兜底，数据可用 JSON 重新导入，
+  所以「升级不闪退」优先于「升级保数据」。
+- 若改了实体字段，务必同时提供迁移；否则老用户会被静默清库。
+
+### DAO 三条查询的形状是 UI 语义的一部分
+
+```sql
+-- observeByDate：当日清单，含已完成，不含已删除
+WHERE deleted = 0 AND dueDate = :date ORDER BY subject ASC, sortOrder ASC, id ASC
+-- observeOverdue：逾期，未完成 + 未删除 + 早于今天
+WHERE deleted = 0 AND isDone = 0 AND dueDate < :today ORDER BY dueDate ASC, subject ASC, sortOrder ASC, id ASC
+-- observeAllDates：日期条的候选来源
+SELECT DISTINCT dueDate FROM homework_items WHERE deleted = 0 ORDER BY dueDate DESC
+```
+
+- 不要为了「性能」把 `deleted = 0` 去掉再在内存里过滤：软删除行会污染 `observeAllDates`，日期条会冒出空日期。
+- 写操作只有四个：`insertAll`（`OnConflictStrategy.IGNORE`）、`setDone`、`setDeleted`、`purgeDeleted`。
+  `insertAll` 返回 `List<Long>`，**`-1L` 代表被跳过**，`Repository.import` 据此算出 `(inserted, skipped)`。
+
+---
+
+## 5. JSON 导入格式
+
+**权威字段名是 `name`，不是 `subject`。** SKILL.md、README 示例与解析器三处现已一致，
+以 `HomeworkJsonParser` 为准：
+
+```json
+{
+  "date": "2026-11-05",
+  "subjects": [
+    { "name": "数学", "items": ["课本 P42 第 1-5 题", "练习册 P18 全部"] },
+    { "name": "语文", "items": ["背诵《静夜思》"] }
+  ]
+}
+```
+
+解析器行为（`HomeworkJsonParser`）：
+
+- 顶层接受**对象**，也接受**对象数组** `[ {...}, {...} ]`（多天一起导入），其余类型报错。
+- `date` 必填，`uuuu-MM-dd` 且 `ResolverStyle.STRICT`（`2026-02-30` 会被拒）。
+- `subjects` 必填且非空；每项必须有非空 `name` 与数组 `items`；`items` 元素必须是字符串，空串会被静默跳过。
+- 成功后返回 `Success(items, dates)`，`dates` 是去重后的日期集合；`ViewModel.importJson` 会跳到 `dates.first()`。
+- 失败返回 `Error(message, line?)`，`line` 由括号配平粗略估算，用于在输入框下方显示错误块。**不清空用户输入**。
+- 每次导入的 `sortOrder` 按 `date|subject` 分组从 0 递增。
+
+改格式时的同步面：`HomeworkJsonParser` ↔ `SKILL.md`（assets） ↔ `README.md` 示例，三处必须一起改。
+
+---
+
+## 6. UI 契约（这些是修过的 Bug，别改回去）
+
+### 6.1 空态必须是列表里的一段，不能整屏替换
+
+`HomeworkScreen` 的 `LazyColumn` 渲染顺序固定：
+
+```
+item("datebar")                                    ← 恒在，永远第一个
+if (state.isEmpty)        item("empty")
+if (state.isToday && state.overdue.isNotEmpty()) item("overdue")
+if (state.groups.isNotEmpty()) { item("todayHeader"); item("todayList") }
+item("skill")
+```
+
+- **日期条不能被空态吞掉**：否则「今天没有作业」会把通往昨天/前天的入口一起隐藏，用户以为整个清单空了。
+- `contentPadding = PaddingValues(bottom = 96.dp)`，别漏，否则最后一行被 FAB 挡住。
+- `LazyColumn` 新增区块请继续用**字符串 key**，与现有风格一致。
+
+### 6.2 `isEmpty` 的判定分视角
+
+```kotlin
+val isEmpty get() = if (isToday) groups.isEmpty() && overdue.isEmpty()
+                    else        groups.isEmpty()
+```
+
+历史日期视角下逾期栏根本不渲染，所以**不能**把 `overdue` 算进空态判断，
+否则「删光某一天」会被其他日期的逾期项掩盖，变成一片空白。
+
+### 6.3 悬空日期必须回落
+
+`HomeworkViewModel.init` 里有一条独立协程订阅 `repo.observeAllDates()`：
+选中日期 ≠ 今天且已从数据库消失时，自动回落到今天。没有它，会停在
+「标题写着 11 月 3 日、日期条里却没有 11 月 3 日」的矛盾状态。
+
+`availableDates` 在 `combine` 中拼为 `(dates + todayStr).distinct().sortedDescending()`——**今天始终可选**。
+
+### 6.4 完成 ≠ 删除
+
+- 勾选：`isDone` 置位，条目**留在原地**，划线 + 灰化。
+- 滑动：`SwipeToDismissBox`，触发后 `deleted` 置位，Snackbar 提供「撤销」。
+- 撤销判定靠 `msg.startsWith("已删除")`；非删除类消息必须清空 `lastDeleted`，防止误撤销上一条。
+
+### 6.5 滑动删除的动画复位
+
+`HomeworkItemRow` 的 `rememberSwipeToDismissBoxState`：
+
+- `confirmValueChange` **只返回 Boolean**，不要在里面调数据层。
+- 真正删除放在 `LaunchedEffect(dismissState.currentValue)` 里，删完立刻 `dismissState.reset()`。
+
+原因：让行消失的应该是**数据变化**，不是组件内部状态。否则数据没刷新或被撤销时，
+组件会卡在「已滑开但仍占位」的半死状态，再也滑不回来。
+
+### 6.6 可点击组件：命中区域 = 视觉区域
+
+`ImportDialog` 里的工具按钮叫 **`AssitTool`**（历史上少写一个 `s`，是既有标识符，重命名需全量替换）。
+
+它刻意不用 `IconButton + 裸 Text` 的组合，而是：
+
+```kotlin
+Row(
+    Modifier
+        .clip(MaterialTheme.shapes.small)
+        .clickable(
+            interactionSource = interactionSource,
+            indication = LocalIndication.current,   // ← androidx.compose.foundation
+            onClick = onClick
+        )
+        .then(Modifier.semantics(mergeDescendants = true) {
+            role = Role.Button
+            onClick(label = text) { onClick(); true }
+        })
+        .padding(horizontal = 8.dp, vertical = 6.dp)
+)
+```
+
+新写任何「图标 + 文字」的按钮请沿用这个模式：**整块可点、有涟漪、语义合并成一个 Button**。
+图标一律 `contentDescription = null`，由外层文字标签承担朗读，避免 TalkBack 读两遍。
+
+### 6.7 其他 UI 约定
+
+- 主题类名是 `TodoListTheme`（`ui/theme/Theme.kt`），`MainActivity` 里包一层。
+- `MainActivity` 用 `permissionVersion` 驱动重组：权限状态变化后 `key(version) { HomeworkScreen(...) }`，
+  Skill 卡片依赖它刷新。删掉会导致「授权后回来仍显示未授权」。
+- `onResume` 里会再次尝试 `SkillInstaller.install()`，这条路径不要去掉。
+
+---
+
+## 7. Skill 分发
+
+- 唯一真源：`app/src/main/assets/skills/homework-import/SKILL.md`。
+- 安装目标：`/sdcard/Download/Operit/skills/homework-import/SKILL.md`。
+- 幂等：`SkillInstaller` 用 SHA-256 比对，内容一致直接跳过。
+- 权限：Android 11+ 需 `MANAGE_EXTERNAL_STORAGE`（`Environment.isExternalStorageManager()`），
+  跳 `ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION`；Android 10- 用 `WRITE_EXTERNAL_STORAGE` 运行时权限。
+- 清单里还声明了 `READ_EXTERNAL_STORAGE`（maxSdk 32）与 `MANAGE_EXTERNAL_STORAGE`（`tools:ignore="ScopedStorage"`），
+  去掉会连带影响 Skill 写入。
+- 改了 `SKILL.md` 只需重新构建，安装逻辑会自动检测哈希变化并覆盖。
+
+---
+
+## 8. 修改流程（沿用既有节奏）
+
+1. `grep_code` / `grep_context` 定位，**别一上来就通读全项目**。
+2. 分段读全文，确认上下文与调用方。
+3. 写清根因，再动代码。
+4. `./gradlew :app:assembleDebug 2>&1 | grep -E "^(e:|w:)|error:|BUILD"` 确认零 error 零 warning。
+5. 复制产物到 `/sdcard/Download/作业清单/作业清单-vX.Y-debug.apk`，记录文件大小与 MD5。
+6. 同步更新 `README.md`：新增「修复说明」小节 + 「回归验证」清单。
+7. 大改动前建议先备份到 `.fixbak/todolist-<HHMMSS>/`（现有基线：`.fixbak/todolist-172157/`）。
+
+交付目录现状（均为 20,387,672 字节）：`v1.0` / `v1.1` / `v1.2` / `v1.3` / `v1.4`。
+
+---
+
+## 9. 已知陷阱清单
+
+| 陷阱 | 说明 |
+| --- | --- |
+| `LocalIndication` 导入错包 | 属于 `androidx.compose.foundation`，**不是** `androidx.compose.material3`。导错会报 `Unresolved reference 'LocalIndication'`。 |
+| README 示例字段 `subject` | 解析器真正读的是 `name`，示例文案是历史遗留。改文档时顺手修正。 |
+| 测试类包名 | `app/src/test`、`app/src/androidTest` 下仍是模板的 `com.java.myapplication`，与主包不一致，内容也是模板示例。跑测试前需重命名包或删除。 |
+| `@Entity` 索引 ≠ 部分唯一索引 | 唯一性只在 `MIGRATION_1_2` 的 SQL 里，Room 无法从实体注解推导。升版本必须手写迁移。 |
+| `AssitTool` 拼写 | 少一个 `s`。IDE 重命名会把它改掉，注意别在 diff 里产生大面积无意义改动。 |
+| 空态整屏替换 | 曾经踩过：日期条被吞，用户无法切到历史日期。见 §6.1。 |
+| 在 `confirmValueChange` 里删数据 | 会让行卡在 dismissed。见 §6.5。 |
+
+---
+
+## 10. 一句话原则
+
+> **完成与删除分离、唯一性靠部分索引、空态嵌在列表里、命中区等于视觉区、文案只在 ViewModel。**
+> 这五条是这个项目全部修复历史的沉淀，改任何一处之前先确认不会破坏它们。

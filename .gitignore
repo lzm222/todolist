@@ -1,0 +1,27 @@
+# ===== Gradle / 构建产物 =====
+.gradle/
+.kotlin/
+build/
+/captures
+.externalNativeBuild
+.cxx
+
+# ===== 本机 SDK 路径（含机器相关绝对路径，不入库）=====
+local.properties
+
+# ===== IDE =====
+.idea/
+*.iml
+.DS_Store
+
+# ===== Operit 工作区运行期目录（对话缓存 / 配置，非源码）=====
+.operit/
+.backup/
+
+# ===== 本地备份快照（.fixbak/todolist-<HHMMSS>/）=====
+.fixbak/
+
+# ===== 随手产物 =====
+*.apk
+*.aab
+*.log
