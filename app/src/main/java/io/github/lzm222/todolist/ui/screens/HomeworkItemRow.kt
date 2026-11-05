@@ -47,6 +47,7 @@ import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import io.github.lzm222.todolist.data.HomeworkItem
+import kotlinx.coroutines.flow.filter
 import kotlin.math.roundToInt
 
 /** 左滑露出的删除按钮宽度，固定 88dp：恰好容纳图标 + 「删除」二字 */
@@ -127,68 +128,58 @@ fun HomeworkItemRow(
     // 否则永远是首次组合时的 isRevealed，起手占位判断就会错。
     val currentIsRevealed = rememberUpdatedState(isRevealed)
 
-    // 是否正被手指拖动。拖动中不允许被「互斥复位」强制收回：
+    // 是否正被手指拖动。拖动中一律不让互斥逻辑插手：
     // 此时 animateTo 会和用户手势抢同一个值，表现为抖动/突然跳位。
-    // 处理办法是「拖动中先记账，松手后再收」。
+    // 松手后（isDragging 变 false）effect 会重跑一次，把拖动期间欠下的
+    // 「收起」补做掉 —— 所以拖动中直接 return 是安全的。
     var isDragging by remember { mutableStateOf(false) }
 
-    // 拖动交互源：用于在「手指刚开始拖」的瞬间就抢占展开态。
-    // 这是修两个 Bug 的关键 —— 见下方 collect 里的说明。
+    // 拖动交互源：用于在「手指刚开始拖」的瞬间抢占「拖动名额」（多指互斥），
+    // 以及判断拖动何时结束。注意它**不**用来抢占展开态 —— 方向未定时还不能占，
+    // 见下方按 offset 判方向的那个 effect。
     val interactionSource = remember { MutableInteractionSource() }
 
-    // 展开态互斥：父层收起了我 / 别人展开了 / 进入多选 → 复位。
+    // 展开态互斥：**只负责收起，永不主动展开**。
     //
-    // 这里必须把 isDragging 作为 key（拖动开始时就要让开），但**松手后不能被重跑带偏**：
-    // 若不加区分，松手瞬间 effect 会重跑，而此时父层的 isRevealed 仍是 true
-    // （收起通知还没回传）→ 又 animateTo(Open)，把用户刚右滑关掉的抽屉弹回去。
+    // 这里曾经是双向收敛（含 animateTo(Open)），埋了一个「右滑却把抽屉滑开」的坑：
+    // 右滑同样会越过触摸阈值、派发 DragInteraction.Start，起手即占位会先把本行
+    // 报成「正在展开」，松手时 effect 看到 isRevealed == true 就 animateTo(Open)，
+    // 于是手指明明往右走，抽屉却自己滑出来（v1.7.2 反馈的「右滑被判断成左滑」）。
     //
-    // 解法：拖动起手时记下当时的 isRevealed 快照（dragStartRevealed）。
-    // 松手后若 isRevealed 与快照相同，说明「父层在这轮拖动中没改主意」，
-    // 落点完全由手势决定，effect 不干预；若不同，才按父层的新意图收敛。
-    var dragStartRevealed by remember { mutableStateOf<Boolean?>(null) }
+    // 为什么单向就够：
+    //   1) 本行被父层标记为展开，只可能来自「本行自己在拖动中往左动过」的上报
+    //      （见下方按 offset 判方向的那个 effect），落点因此必须由手势决定，
+    //      互斥 effect 不该插手；
+    //   2) 手势确实把行关掉了（右滑关闭）时，由 snapshotFlow(settledValue) 反向
+    //      通知 onRevealChange(false)，父层自己会清掉 revealedId，不需要 effect 代劳；
+    //   3) 「父层要收起」必须执行，所以收起分支保留。
     LaunchedEffect(isRevealed, selectionMode, isDragging) {
-        val shouldOpen = isRevealed && !selectionMode
-        val target = if (shouldOpen) RowAnchor.Open else RowAnchor.Settled
-        if (isDragging) {
-            // 手势正在掌控：读与写都让开
-            return@LaunchedEffect
-        }
-        // 非拖动状态：若刚结束的一轮拖动里父层意图没变，让手势结果保留
-        val snapshot = dragStartRevealed
-        if (snapshot != null) {
-            dragStartRevealed = null
-            if (snapshot == isRevealed) {
-                // 父层没改主意 → 尊重手势落点，不覆盖
-                return@LaunchedEffect
-            }
-        }
-        if (state.currentValue != target || state.targetValue != target) {
-            state.animateTo(target)
+        // 拖动期间一律让开：手势正在掌控 offset，animateTo 会与它抢值（v1.7.1）
+        if (isDragging) return@LaunchedEffect
+        // 父层仍希望本行展开 → 落点听手势的，不干预
+        if (isRevealed && !selectionMode) return@LaunchedEffect
+        // 父层要收起（含「别人抢占了展开态」「进了多选」）→ 必须收
+        if (state.currentValue != RowAnchor.Settled || state.targetValue != RowAnchor.Settled) {
+            state.animateTo(RowAnchor.Settled)
         }
     }
 
-    // 把自己「开始展开」的动作上报给父层（父层据此立刻收起其它行）。
+    // 拖动状态上报给父层：占用「拖动中」名额，其余行随即被禁用拖拽。
     //
-    // 这里**不用 settledValue**：它只在动画彻底停稳后才更新，导致「拉 B 行」要等
-    // B 完全打开才通知父层去关 A —— 就是「新抽屉完全打开后，旧抽屉才开始关」。
+    // 这里用 DragInteraction.Start：手指一按下、拖动真正开始的那一刻就会发出，
+    // 早于任何阈值判断。多指同时拖时，每一行在起手瞬间都试图抢 draggingId，
+    // 父层是单值，后来者覆盖先前者，先前者立刻被物理禁用 —— 两根手指按住不放
+    // 也不可能同时拉开两个抽屉。
     //
-    // 改用 DragInteraction.Start：手指一按下、拖动真正开始的那一刻就会发出，
-    // 早于任何阈值判断。于是：
-    //   1) 旧的抽屉立刻开始收起，而不是等新的停稳；
-    //   2) 多指同时拖时，每一行在起手瞬间都试图抢占 revealedId，
-    //      父层的 revealedId 是单值，后来者覆盖先前者，先前者随即被 animateTo(Settled)
-    //      收回 —— 物理上不可能同时停两个抽屉在 Open。
+    // 注意：这里**只**占「拖动名额」，不占「展开名额」。占展开名额必须等到
+    // 方向确定了再报（见下方按 offset 判方向的 effect），否则一次右滑就会
+    // 抢着把别人的抽屉收起来（v1.7.2）。
     LaunchedEffect(interactionSource) {
         interactionSource.interactions.collect { interaction ->
             when (interaction) {
                 is DragInteraction.Start -> {
                     isDragging = true
-                    // 记下本轮拖动开始时父层的意图，供松手后判定「父层是否改过主意」
-                    dragStartRevealed = currentIsRevealed.value
-                    // 上报给父层：占用「拖动中」名额，其余行随即被禁用拖拽
                     currentOnDragStateChange.value(true)
-                    // 起手即占位：先让父层知道「现在是我在展开」
-                    if (!currentIsRevealed.value) currentOnRevealChange.value(true)
                 }
                 is DragInteraction.Stop, is DragInteraction.Cancel -> {
                     isDragging = false
@@ -199,18 +190,41 @@ fun HomeworkItemRow(
         }
     }
 
+    // 「起手即占位」——但**按方向**占位：只有真的往左拖动过，才宣称「现在是我在展开」。
+    //
+    // 为什么不能在 DragInteraction.Start 里直接占位：左右两个方向都会越过触摸
+    // 阈值、都会派发 Start。一次右滑如果也去占位，父层的 revealedId 会被抢走，
+    // 别人展开着的抽屉就无端收起，观感正是「右滑被判成了左滑」。
+    //
+    // offset 由库钳制在 [-88dp, 0f]（AnchoredDraggableState.newOffsetForDelta 内部
+    // coerceIn(minPosition, maxPosition)），所以「offset < 0」与「手指在往左拖」
+    // 严格等价，右滑永远不可能触发。NaN 参与比较恒为 false，首帧也安全。
+    // 用 1px 而不是 0f 作阈值：避免手指几乎没动就被判成左滑。
+    //
+    // 订阅 offset 不会引起重组：snapshotFlow 只在协程里读状态，不建立组合期依赖。
+    LaunchedEffect(state) {
+        snapshotFlow { state.offset < -1f }
+            .filter { it }
+            .collect {
+                // 每次「从非左滑变成左滑」时确认一次父层已知晓，重复上报由父层幂等吸收
+                if (!currentIsRevealed.value) currentOnRevealChange.value(true)
+            }
+    }
+
     // 拖动结束后，按真实落点纠正一次：
-    // 没过阈值就回弹的情况，起手时虽然占了位，但要立刻把位子还回去。
+    // 没过阈值就回弹、或者右滑关掉的情况，都要把「到底开着还是关着」如实回报给父层。
+    //
+    // 这里必须读 currentIsRevealed 而不是直接读 isRevealed：本 effect 的 key 只有
+    // state，闭包里的 isRevealed 会永远停在首次组合时的值（通常 false），
+    // 结果是「关掉了却不回报 false」，父层的 revealedId 会一直残留。
     LaunchedEffect(state) {
         snapshotFlow { state.settledValue }.collect { settled ->
             val open = settled == RowAnchor.Open
-            if (open != isRevealed) {
+            if (open != currentIsRevealed.value) {
                 currentOnRevealChange.value(open)
             }
         }
     }
-
-    // 松手对账已合并进上面的互斥 effect（用 dragStartRevealed 快照判定），此处无需额外逻辑。
 
     // 关键：**不要**在这里读 state.offset。
     //

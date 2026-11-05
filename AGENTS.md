@@ -336,33 +336,46 @@ val isEmpty get() = if (isToday) groups.isEmpty() && overdue.isEmpty()
   - 判据：**这个值每帧都会变吗？** 是 → 走绘制/布局阶段；否 → 可以进组合。
   - `state.settledValue` 属低频（仅动画结束变化），在组合期读是可接受的。
 - **互斥必须在输入层阻断，不能只靠状态收敛**：`settledValue` 只在动画停稳后更新，
-  靠它做互斥会出现「新抽屉完全打开后，旧抽屉才开始关」。正确做法有两条，缺一不可：
-  1. **起手上报**：给 `anchoredDraggable` 传 `interactionSource`，监听
-     `DragInteraction.Start` —— 手指一按下、拖动真正开始时就发，早于任何阈值判断，
-     用它在**起手瞬间**把 `onRevealChange(true)` 报给父层，旧的抽屉立刻开始收。
-  2. **物理禁止**：某行起手时上报 `draggingId`，父层把其余所有行的
-     `anchoredDraggable(enabled = false)`。第二根手指在别的行上根本拖不动。
-     只做第 1 条不够 —— 只要两指都按住不放，两个抽屉就会同时停在 `Open`。
+  靠它做互斥会出现「新抽屉完全打开后，旧抽屉才开始关」。正确做法是两件**彼此独立**的事：
+  1. **占「拖动名额」用 `DragInteraction.Start`**：手指刚开始拖就发，早于任何阈值判断。
+     上报 `draggingId`，父层把其余行的 `anchoredDraggable(enabled = false)`。第二根手指
+     在别的行上根本拖不动 —— 只靠事后收回 `revealedId` 总有延迟，两指按住不放时
+     两个抽屉都会同时停在 `Open`。
+  2. **占「展开名额」必须按方向**：同样监听 `interactionSource`，但**不能**在 `Start` 里
+     报 `onRevealChange(true)` —— `Start` 在左右两个方向都会派发。改成订阅
+     `snapshotFlow { state.offset < -1f }`，只有真的往左拖动过才宣称「现在是我在展开」，
+     旧的抽屉此时立刻开始收（仍在同一帧内，肉眼等同「起手即收」）。
+     `offset` 被库钳在 `[-buttonWidthPx, 0f]`，所以「`offset < 0`」与「手指在往左拖」
+     严格等价，右滑不可能触发；`NaN` 参与比较恒为 `false`，首帧也安全。
 - **拖动中不能被强制收回**：`isDragging` 为 true 时，即便 `isRevealed` 变 false 也
   **不要**调 `animateTo(Settled)`：手势正在掌控这个值，抢控制权会抖动/跳位。
   让手势先结束（`DragInteraction.Stop` / `Cancel`），之后再收敛。
   → 判断要写成**一律让开**（`if (isDragging) return`），不能只挡「目标为收起」。
   只挡收起会让已展开的行右滑时被 `animateTo(Open)` 拽回，表现为「右滑关不掉」（v1.7.1）。
-- **松手后不能按 `isRevealed` 反推落点**：松手瞬间父层的 `isRevealed` 还是旧值
-  （收起通知未回传），直接 `animateTo` 会把它弹回去。用 `dragStartRevealed` 快照：
-  起手记录父层意图，松手后若 `isRevealed` 与快照相同 → 父层没改主意 → **尊重手势落点、不覆盖**；
-  不同才按新意图收敛。见 §9。
+- **互斥 effect 必须单向：只收不开，禁止出现 `animateTo(Open)`**：
+  父层「要展开」只等于「这一行被允许开着」，落点仍由手势决定；effect 若也去写 `Open`，
+  就是和手势抢同一个值。收起分支则必须保留（别人抢占、切日期、进多选、滚动都要收）。
+  现行写法三段：`if (isDragging) return` → `if (isRevealed && !selectionMode) return`
+  → `animateTo(Settled)`。
+  - 历史教训：v1.7.1 曾用 `dragStartRevealed` 快照做双向收敛，而快照恰好记在
+    「起手占位自我上报」**之前**（值恒为 `false`），松手时 `false != true` 被判成
+    「父层改主意」→ 对一行**已关闭**的行右滑，抽屉反而自己滑开（v1.7.2 修的就是这个）。
+  - 手势真把行关掉（右滑关闭）时，由 `settledValue` 的 `snapshotFlow` 反向通知父层，
+    不需要 effect 代劳 —— 数据流单向：手势定落点 → 上报 → 父层更新 `revealedId`。
 - **`draggingId` 必须有悬空兜底**：行在拖动中被删除时 `Stop` 不会回传，
   `draggingId` 悬空会让**所有行永久不可拖**。在持有 `draggingId` 的父层里监听可见集合，
   发现该 id 已不在列表中立即释放。
 - **`LaunchedEffect(interactionSource)` 里读 `isRevealed` 要用 `rememberUpdatedState`**：
   该 effect 的 key 只有 `interactionSource`，直接读闭包变量永远是首次组合时的值。
-- **展开/收起由 `isRevealed` 单向驱动**：`LaunchedEffect(isRevealed, selectionMode)` 里
-  `shouldOpen = isRevealed && !selectionMode` → `animateTo(Open / Settled)`。
+- **展开/收起不是对称的**：父层「要收起」必须由 effect 执行（`animateTo(Settled)`）；
+  父层「要展开」只是「这一行被允许开着」，落点仍然听手势的。
   行**允许长期停在 `Open`**，这是「等用户再点按钮」的载体。
 - **回写给父层用 `settledValue`**：`LaunchedEffect(state)` 里
   `snapshotFlow { state.settledValue }.collect { onRevealChange(it == RowAnchor.Open) }`。
   用 `settledValue` 而非 `currentValue`/`targetValue`，避免动画途中的中间态抖动回调。
+  **比较对象必须读 `rememberUpdatedState`**（`currentIsRevealed.value`）：该 effect 的 key
+  只有 `state`，直接读闭包里的 `isRevealed` 会永远停在首次组合值（通常 `false`），
+  结果是「关掉了却不回报 `false`」，父层 `revealedId` 一直残留（v1.7.2 顺手修的）。
 - **背景按钮可用性**：`enabled = state.settledValue == RowAnchor.Open`，
   只有真正停靠在展开锚点后才可点，避免动画途中误触。
 - 展开是**互斥**的：`HomeworkScreen` 用 `revealedId: Long?` 保存唯一展开行的 id，
@@ -434,13 +447,14 @@ Row(
 7. 大改动前建议先备份到 `.fixbak/todolist-<HHMMSS>/`（现有基线：`.fixbak/todolist-172157/`）。
 8. `git add -A && git commit`，**一个 Bug 一次提交**，见 §8.1。
 
-交付目录现状（均为 20,387,672 字节）：`v1.0` / `v1.1` / `v1.2` / `v1.3` / `v1.4` / `v1.5` / `v1.6` / `v1.6.1` / `v1.6.2` / `v1.6.3` / `v1.7` / `v1.7.1`。
+交付目录现状（均为 20,387,672 字节）：`v1.0` / `v1.1` / `v1.2` / `v1.3` / `v1.4` / `v1.5` / `v1.6` / `v1.6.1` / `v1.6.2` / `v1.6.3` / `v1.7` / `v1.7.1` / `v1.7.2`。
 - v1.6 的 MD5 为 `6a2a556671625e4240c8a2357292a3cd`（滑动删除改为 `anchoredDraggable` 实现）。
 - v1.6.1 的 MD5 为 `0c782dadd44e89cf61b867fdfe6e072b`（修复首帧 `Cannot round NaN value` 崩溃）。
 - v1.6.2 的 MD5 为 `43d6f794890015490e6026ea264d4103`（修复 `progress` 符号导致删除按钮隐形）。
 - v1.6.3 的 MD5 为 `dcb982c65d1897ad46ea398f8969db01`（修复组合期读 `offset` 导致的滑动卡顿）。
 - v1.7 的 MD5 为 `fde6ffd1f9093646a1113dec41d9a59b`（起手即互斥 + 多指物理禁用）。
 - v1.7.1 的 MD5 为 `29c48a99708a111aa09f892100c3557f`（修复展开态右滑无法关闭）。
+- v1.7.2 的 MD5 为 `4f41b507933ac546e204bd6edb49fc92`（修复右滑被误判为左滑、抽屉自己滑开）。
 
 ### 8.1 版本控制约定
 
@@ -507,7 +521,10 @@ git status --short    # 期望空输出
 | 只靠收 `revealedId` 实现互斥 | 状态收敛永远有延迟，两指都按住不放时两个抽屉会同时停在 `Open`。必须在输入层阻断：上报 `draggingId`，其余行 `enabled = false`。见 §6.5。 |
 | 拖动中强行 `animateTo(Settled)` 收回 | 手势正在掌控该值，抢控制权会抖动/跳位。等 `Stop`/`Cancel` 之后再收敛。见 §6.5。 |
 | 互斥 effect 只挡「目标为收起」 | 判断写成 `if (!shouldOpen && isDragging) return` 时，**已展开行右滑**的 `shouldOpen` 仍为 true → `animateTo(Open)` 把用户滑动当场拽回，表现为「右滑关不掉」。必须 `if (isDragging) return` 一律让开。v1.7.1 就踩了这条。见 §6.5。 |
-| 松手后按 `isRevealed` 反推落点 | 松手瞬间父层的 `isRevealed` 还是旧值（收起通知未回传），直接 `animateTo` 会把刚关掉的抽屉弹回去。必须用 `dragStartRevealed` 快照判定父层是否改主意。v1.7.1 踩过。见 §6.5。 |
+| 松手后按 `isRevealed` 反推落点 | 松手瞬间父层的 `isRevealed` 还是旧值（收起通知未回传），直接 `animateTo` 会把刚关掉的抽屉弹回去。v1.7.1 曾用 `dragStartRevealed` 快照绕开，结果快照记在「起手占位自我上报」之前（恒为 `false`），松手时 `false != true` 被判成「父层改主意」→ 右滑把抽屉拉开。v1.7.2 改成**只收不开**，这条路径被结构性删除。见 §6.5。 |
+| 在 `DragInteraction.Start` 里无条件 `onRevealChange(true)` | `Start` 在左右两个方向都会派发。右滑也去占「展开名额」的话：①父层 `revealedId` 被抢走，别人展开的抽屉无端收起；②只要互斥 effect 还带 `Open` 分支，松手就把这一行**拉开**——表现为「右滑被判成左滑」。占展开名额必须看 `state.offset < 0`（库已把 `offset` 钳在 `[-buttonWidthPx, 0f]`，与「手指往左」严格等价）。见 §6.5。 |
+| 互斥 effect 里写 `animateTo(Open)` | 「要不要开」本该由手势决定。父层「要展开」只是允许开着，effect 也去写 `Open` 就是抢值。正确做法是把 `Open` 分支**删掉**，而不是给它加各种条件判断。见 §6.5。 |
+| `snapshotFlow` 里读未 `rememberUpdatedState` 的 `isRevealed` | 该 effect 的 key 只有 `state`，闭包值永远是首次组合时的（通常 `false`）→「关掉了却不回报 `false`」，父层 `revealedId` 一直残留。v1.7.2 之前一直是错的。见 §6.5。 |
 | `draggingId` 没有悬空兜底 | 行在拖动中被删除时 `Stop` 不回传，`draggingId` 悬空 → **所有行永久不可拖**。父层要监听可见集合，发现 id 消失立即释放。见 §6.5。 |
 | 用 `currentValue`/`targetValue` 回写 `onRevealChange` | 动画途中值会抖动，导致展开态反复翻转。必须用 `settledValue`。见 §6.5。 |
 | 拿 `lint` 当编译检查 | 本项目无 ktlint/detekt，只有 AGP 的 Android Lint；它查资源/API/可访问性，**不做 Kotlin 类型检查**，且实测首次 3m59s（`real 4m0s` / `user 6.9s`，慢在 IO）。日常校验用 `:app:compileDebugKotlin`。见 §3.1。 |
