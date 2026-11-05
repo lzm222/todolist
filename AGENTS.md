@@ -21,6 +21,7 @@ JSON 导入格式的权威定义在 [`SKILL.md`](./app/src/main/assets/skills/ho
 | Room / Compose BOM | 2.8.5 / 2026.01.01 |
 | JDK | 17，且 `isCoreLibraryDesugaringEnabled = true`（依赖 `java.time`） |
 | 产物 | `app/build/outputs/apk/debug/app-debug.apk` |
+| 版本控制 | git 2.43.0，本地仓库，分支 `main`，无 remote（见 §8.1） |
 
 **构建环境是 ARM64 + Proot（无 Android Studio）**，这一点决定了两处不能动的配置，见 §3。
 
@@ -282,8 +283,46 @@ Row(
 5. 复制产物到 `/sdcard/Download/作业清单/作业清单-vX.Y-debug.apk`，记录文件大小与 MD5。
 6. 同步更新 `README.md`：新增「修复说明」小节 + 「回归验证」清单。
 7. 大改动前建议先备份到 `.fixbak/todolist-<HHMMSS>/`（现有基线：`.fixbak/todolist-172157/`）。
+8. `git add -A && git commit`，**一个 Bug 一次提交**，见 §8.1。
 
 交付目录现状（均为 20,387,672 字节）：`v1.0` / `v1.1` / `v1.2` / `v1.3` / `v1.4`。
+
+### 8.1 版本控制约定
+
+仓库根即本工作区根，`git init -b main` 建立，首次提交 `7c56e59`
+（`chore: 初始化版本控制，纳入 v1.4 基线`，56 文件 / 4102 行）。**当前无 remote，纯本地仓库。**
+
+本地配置（**全部是本仓库级，刻意没用 `--global`**，换机器不会串味）：
+
+| 配置 | 值 | 为什么 |
+| --- | --- | --- |
+| `user.name` / `user.email` | `lzm222` / `lzm222@users.noreply.github.com` | 提交署名，GitHub 隐私邮箱 |
+| `core.autocrlf` | `false` | 避免 CRLF↔LF 转换把整文件变成「全改」 |
+| `core.quotepath` | `false` | 中文路径（`assets/skills/homework-import/SKILL.md` 等）正常显示，不转义成 `\346\226\207` |
+| `core.fileMode` | `false` | Android 上权限位恒为 777，关掉可执行位跟踪才能避免无意义 diff |
+
+`.gitignore` 六段（28 行），**这七项必须保持被忽略，任一条丢失都会污染仓库**：
+
+| 忽略项 | 原因 |
+| --- | --- |
+| `.gradle/`、`.kotlin/`、`build/`（含 `app/build`） | 构建缓存与产物。`app/build` 单目录 97M，而 `app/src` 只有 342K——源码小、产物大，产物绝不能入库 |
+| `local.properties` | 内容是 `sdk.dir=/root/Android`，**机器绝对路径**，入库必冲突 |
+| `.operit/`、`.backup/` | Operit 工作区运行期数据（对话、对象存储），与项目无关 |
+| `.fixbak/` | 本地备份快照（`todolist-<HHMMSS>/`），大改动前临时用，不入库 |
+| `*.apk` / `*.aab` / `*.log` | 随手产物。正式产物应放 `/sdcard/Download/作业清单/`，不进仓库 |
+
+验证手段（随时可跑）：
+
+```bash
+git check-ignore -v app/build local.properties .operit .backup .fixbak .gradle .kotlin
+git status --short    # 期望空输出
+```
+
+提交信息格式：`<type>: <一句话>`，type 用 `fix` / `feat` / `chore` / `docs`。
+修复类提交在正文里写清「问题 → 根因 → 修复」，与 README 的修复说明表对齐。
+
+**注意**：v1.0–v1.3 无源码留存，git 历史里只有 v1.4 之后的内容；
+回溯更早版本只能看 `README.md` 的修复说明与回归验证小节，不要指望 `git log`。
 
 ---
 
@@ -298,6 +337,7 @@ Row(
 | `AssitTool` 拼写 | 少一个 `s`。IDE 重命名会把它改掉，注意别在 diff 里产生大面积无意义改动。 |
 | 空态整屏替换 | 曾经踩过：日期条被吞，用户无法切到历史日期。见 §6.1。 |
 | 在 `confirmValueChange` 里删数据 | 会让行卡在 dismissed。见 §6.5。 |
+| 往仓库里漏提交 `app/build` 或 `local.properties` | `app/build` 有 97M，`local.properties` 含 `/root/Android` 机器路径。`git add -A` 前先 `git status --short` 扫一眼，或用 `git add -A --dry-run` 预检。见 §8.1。 |
 
 ---
 

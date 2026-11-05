@@ -234,3 +234,39 @@ chmod +x ./setup_android_env.sh
 
 三者分工不要混。**改代码前先读 `AGENTS.md`**；JSON 导入格式以 `SKILL.md` 与
 `HomeworkJsonParser` 为准（字段名是 `name`，不是 `subject`）。
+
+---
+
+## 七、版本控制
+
+项目自 v1.4 起纳入 git 管理，仓库根就是项目根，主干分支 `main`。
+
+```bash
+git log --oneline          # 7c56e59 chore: 初始化版本控制，纳入 v1.4 基线
+git status --short         # 期望空输出（干净）
+./gradlew :app:assembleDebug
+git add -A && git commit -m "fix: ..."
+```
+
+- **首次提交**：`7c56e59`，56 个文件 / 4102 行插入，对应 v1.4 基线（APK 20,387,672 字节）。
+- **远程**：目前没有配置 remote，是纯本地仓库。要备份或协作需自行 `git remote add`。
+- **历史起点**：v1.0–v1.3 没有源码留存，git 里看不到这些版本；它们的变更记录只在本 README 的「修复说明」与「回归验证」小节中。
+
+`.gitignore` 刻意忽略以下几类，**请勿把它们提交进仓库**：
+
+| 忽略项 | 原因 |
+| --- | --- |
+| `build/`（含 `app/build`） | 构建产物，单目录 97M；源码 `app/src` 仅 342K |
+| `.gradle/`、`.kotlin/` | 构建缓存 |
+| `local.properties` | 内容是 `sdk.dir=/root/Android`，机器相关绝对路径 |
+| `.operit/`、`.backup/` | Operit 工作区的运行期数据，与项目无关 |
+| `.fixbak/` | 本地备份快照 |
+| `*.apk`、`*.aab`、`*.log` | 随手产物；正式 APK 归档在 `/sdcard/Download/作业清单/` |
+
+随时可自检：
+
+```bash
+git check-ignore -v app/build local.properties .operit .backup .fixbak .gradle .kotlin
+```
+
+提交信息用 `<type>: <一句话>`，type 取 `fix` / `feat` / `chore` / `docs`；修复类提交在正文写清「问题 → 根因 → 修复」。
